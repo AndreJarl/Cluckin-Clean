@@ -1,1090 +1,998 @@
-import { Feather, FontAwesome5 } from "@expo/vector-icons";
-import DateTimePicker, {
-  DateTimePickerEvent,
-} from "@react-native-community/datetimepicker";
-import dayjs from "dayjs";
+import { Feather, Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import React, { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  Keyboard,
-  KeyboardAvoidingView,
   Modal,
   Platform,
+  Pressable,
+  RefreshControl,
   ScrollView,
-  StyleSheet,
-  Switch,
   Text,
   TextInput,
   TouchableOpacity,
-  TouchableWithoutFeedback,
   View,
 } from "react-native";
-import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView } from "react-native-safe-area-context";
+import {
+  collection,
+  deleteDoc,
+  doc,
+  getDocs,
+  onSnapshot,
+  orderBy,
+  query,
+  setDoc,
+  updateDoc,
+} from "firebase/firestore";
 
-import { useBleCommands } from "@/providers/ble/useBleCommands";
-import { useBleSchedules } from "@/providers/ble/useBleSchedules";
-import { globalStyles } from "@/styles/globalStyle";
+import { db } from "@/lib/firebase";
 
-type FormState = {
-  id: number | null;
+type ScheduleItem = {
+  id: string;
+  scheduleId?: string;
+  date: string;
+  title: string;
+  hour: string;
+  minute: string;
+  duration: string;
+  mode: "AUTO";
   enabled: boolean;
-  repeatDaily: boolean;
-  selectedDate: Date;
-  durationSec: string;
+  status: "PENDING";
+  createdAt?: any;
 };
 
-function createDefaultScheduleDate() {
-  const date = new Date();
-  date.setHours(9, 0, 0, 0);
-  return date;
+type HistoryItem = {
+  id: string;
+  scheduleId?: string;
+  date: string;
+  title: string;
+  hour: string;
+  minute: string;
+  duration: string;
+  mode?: "AUTO";
+  status: "EXECUTED" | "FAILED" | "SKIPPED";
+  executedAt?: any;
+};
+
+const DEVICE_ID = "device_001";
+
+function pad2(value: string | number) {
+  return String(value).padStart(2, "0");
 }
 
-function formatDisplayTime(date: Date) {
-  return dayjs(date).format("h:mm A");
+function getDaysInMonth(year: number, month: number) {
+  return new Date(year, month + 1, 0).getDate();
 }
 
-function formatDisplayDate(date: Date) {
-  return dayjs(date).format("MMMM D, YYYY");
+function getFirstDayOfMonth(year: number, month: number) {
+  return new Date(year, month, 1).getDay();
 }
 
-function buildDateFromSchedule(schedule: {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  repeatDaily: boolean;
-}) {
-  const now = new Date();
-  const hour = Number(schedule.hour) || 0;
-  const minute = Number(schedule.minute) || 0;
+function formatDate(year: number, month: number, day: number) {
+  return `${year}-${pad2(month + 1)}-${pad2(day)}`;
+}
 
-  if (schedule.repeatDaily) {
-    return new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate(),
-      hour,
-      minute,
-      0,
-      0
-    );
+function monthLabel(year: number, month: number) {
+  return new Date(year, month).toLocaleString("en-US", {
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function convertTo24Hour(hour12: string, minute: string, period: "AM" | "PM") {
+  let h = Number(hour12);
+
+  if (h < 1) h = 1;
+  if (h > 12) h = 12;
+
+  const m = Math.min(59, Math.max(0, Number(minute) || 0));
+
+  if (period === "AM") {
+    if (h === 12) h = 0;
+  } else {
+    if (h !== 12) h += 12;
   }
 
-  return new Date(
-    Number(schedule.year) || now.getFullYear(),
-    Math.max((Number(schedule.month) || 1) - 1, 0),
-    Math.max(Number(schedule.day) || 1, 1),
-    hour,
-    minute,
-    0,
-    0
-  );
+  return {
+    hour24: String(h).padStart(2, "0"),
+    minute24: String(m).padStart(2, "0"),
+  };
 }
 
-export default function Schedule() {
-  const { isConnected, lastEvent } = useBleCommands();
-  const {
-    schedules,
-    getSchedules,
-    addSchedule,
-    editSchedule,
-    deleteSchedule,
-    clearSchedules,
-  } = useBleSchedules();
+function formatTo12Hour(hour24: string, minute: string) {
+  let h = Number(hour24);
+  const m = String(minute).padStart(2, "0");
+  const period = h >= 12 ? "PM" : "AM";
+
+  h = h % 12;
+  if (h === 0) h = 12;
+
+  return `${h}:${m} ${period}`;
+}
+
+function buildScheduleDateTime(
+  selectedDate: string,
+  hour12: string,
+  minute: string,
+  period: "AM" | "PM"
+) {
+  const { hour24, minute24 } = convertTo24Hour(hour12, minute, period);
+  const [year, month, day] = selectedDate.split("-").map(Number);
+
+  return new Date(year, month - 1, day, Number(hour24), Number(minute24), 0, 0);
+}
+
+function startOfDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function makeScheduleId(date: string, hour24: string, minute24: string) {
+  return `schedule_${date}_${hour24}${minute24}_${Date.now()}`;
+}
+
+export default function ScheduleScreen() {
+  const now = new Date();
+  const today = startOfDay(now);
+
+  const currentYear = now.getFullYear();
+  const currentMonth = now.getMonth();
+  const todayString = formatDate(
+    currentYear,
+    currentMonth,
+    today.getDate()
+  );
+
+  const [selectedDate, setSelectedDate] = useState(todayString);
+  const [activeTab, setActiveTab] = useState<"saved" | "history">("saved");
 
   const [modalVisible, setModalVisible] = useState(false);
+  const [loadingSchedules, setLoadingSchedules] = useState(true);
+  const [loadingHistory, setLoadingHistory] = useState(true);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [deletingId, setDeletingId] = useState<number | null>(null);
 
-  const [showDatePicker, setShowDatePicker] = useState(false);
-  const [showTimePicker, setShowTimePicker] = useState(false);
+  const [title, setTitle] = useState("");
+  const [hour12, setHour12] = useState("6");
+  const [minute, setMinute] = useState("00");
+  const [period, setPeriod] = useState<"AM" | "PM">("AM");
+  const [duration, setDuration] = useState("10");
 
-  const [formData, setFormData] = useState<FormState>({
-    id: null,
-    enabled: true,
-    repeatDaily: true,
-    selectedDate: createDefaultScheduleDate(),
-    durationSec: "10",
-  });
-
-  const [errors, setErrors] = useState({
-    durationSec: "",
-    selectedDate: "",
-  });
+  const [schedules, setSchedules] = useState<ScheduleItem[]>([]);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
 
   useEffect(() => {
-    if (!isConnected) return;
+    const schedulesRef = collection(db, "devices", DEVICE_ID, "schedules");
+    const schedulesQuery = query(schedulesRef, orderBy("date", "asc"));
 
-    getSchedules().catch((e: any) => {
-      console.log("getSchedules error:", e);
-    });
-  }, [isConnected, getSchedules]);
+    const unsubSchedules = onSnapshot(
+      schedulesQuery,
+      (snapshot) => {
+        const next: ScheduleItem[] = snapshot.docs.map((item) => {
+          const data = item.data() as Omit<ScheduleItem, "id">;
+          return { id: item.id, ...data };
+        });
+        setSchedules(next);
+        setLoadingSchedules(false);
+      },
+      (error) => {
+        console.error("Schedules listener error:", error);
+        setLoadingSchedules(false);
+        Alert.alert("Error", "Failed to load schedules.");
+      }
+    );
 
-  useEffect(() => {
-    console.log("SCHEDULES from ESP =>", schedules);
-    schedules.forEach((item) => {
-      const displayDate = buildDateFromSchedule(item);
-      console.log("SCHEDULE ITEM =>", {
-        raw: item,
-        displayDate: displayDate.toString(),
-        displayHour: displayDate.getHours(),
-        displayMinute: displayDate.getMinutes(),
-        displayFormatted: dayjs(displayDate).format("YYYY-MM-DD hh:mm:ss A"),
-      });
-    });
-  }, [schedules]);
+    const historyRef = collection(db, "devices", DEVICE_ID, "history");
+    const historyQuery = query(historyRef, orderBy("date", "desc"));
 
-  const sortedSchedules = useMemo(() => {
-    return [...schedules].sort((a, b) => {
-      const aRepeat = a.repeatDaily ? 0 : 1;
-      const bRepeat = b.repeatDaily ? 0 : 1;
+    const unsubHistory = onSnapshot(
+      historyQuery,
+      (snapshot) => {
+        const next: HistoryItem[] = snapshot.docs.map((item) => {
+          const data = item.data() as Omit<HistoryItem, "id">;
+          return { id: item.id, ...data };
+        });
+        setHistory(next);
+        setLoadingHistory(false);
+      },
+      (error) => {
+        console.error("History listener error:", error);
+        setLoadingHistory(false);
+        Alert.alert("Error", "Failed to load history.");
+      }
+    );
 
-      if (aRepeat !== bRepeat) return aRepeat - bRepeat;
-
-      const aTime = a.hour * 60 + a.minute;
-      const bTime = b.hour * 60 + b.minute;
-
-      if (aTime !== bTime) return aTime - bTime;
-
-      const aDate = new Date(
-        a.year || 0,
-        Math.max((a.month || 1) - 1, 0),
-        a.day || 1
-      ).getTime();
-
-      const bDate = new Date(
-        b.year || 0,
-        Math.max((b.month || 1) - 1, 0),
-        b.day || 1
-      ).getTime();
-
-      return aDate - bDate;
-    });
-  }, [schedules]);
-
-  const nextScheduleId = useMemo(() => {
-    if (schedules.length === 0) return 1;
-    return Math.max(...schedules.map((s) => s.id)) + 1;
-  }, [schedules]);
-
-  const resetForm = () => {
-    setErrors({
-      durationSec: "",
-      selectedDate: "",
-    });
-
-    const nextDate = createDefaultScheduleDate();
-    console.log("RESET FORM default date =>", {
-      date: nextDate.toString(),
-      hour: nextDate.getHours(),
-      minute: nextDate.getMinutes(),
-      iso: nextDate.toISOString(),
-    });
-
-    setFormData({
-      id: null,
-      enabled: true,
-      repeatDaily: true,
-      selectedDate: nextDate,
-      durationSec: "10",
-    });
-  };
-
-  const openNewModal = () => {
-    if (!isConnected) {
-      Alert.alert("Not Connected", "Please connect to the ESP32 first.");
-      return;
-    }
-
-    resetForm();
-    setFormData((prev) => ({
-      ...prev,
-      id: nextScheduleId,
-    }));
-    setModalVisible(true);
-  };
-
-  const openEditModal = (item: {
-    id: number;
-    enabled: boolean;
-    year: number;
-    month: number;
-    day: number;
-    hour: number;
-    minute: number;
-    repeatDaily: boolean;
-    durationMs: number;
-  }) => {
-    const built = buildDateFromSchedule(item);
-
-    console.log("OPEN EDIT MODAL raw item =>", item);
-    console.log("OPEN EDIT MODAL built date =>", {
-      date: built.toString(),
-      hour: built.getHours(),
-      minute: built.getMinutes(),
-      formatted: dayjs(built).format("YYYY-MM-DD hh:mm:ss A"),
-    });
-
-    setErrors({
-      durationSec: "",
-      selectedDate: "",
-    });
-
-    setFormData({
-      id: item.id,
-      enabled: item.enabled,
-      repeatDaily: item.repeatDaily,
-      selectedDate: built,
-      durationSec: String(Math.round(item.durationMs / 1000)),
-    });
-
-    setModalVisible(true);
-  };
-
-  const validateForm = () => {
-    let ok = true;
-
-    const nextErrors = {
-      durationSec: "",
-      selectedDate: "",
+    return () => {
+      unsubSchedules();
+      unsubHistory();
     };
+  }, []);
 
-    const durationSec = Number(formData.durationSec);
-
-    if (
-      formData.durationSec.trim() === "" ||
-      Number.isNaN(durationSec) ||
-      durationSec < 1 ||
-      durationSec > 600
-    ) {
-      nextErrors.durationSec = "Duration must be from 1 to 600 seconds";
-      ok = false;
-    }
-
-    if (!formData.repeatDaily && Number.isNaN(formData.selectedDate.getTime())) {
-      nextErrors.selectedDate = "Please choose a valid date";
-      ok = false;
-    }
-
-    setErrors(nextErrors);
-    return ok;
-  };
-
-  const handleRefresh = async () => {
-    if (!isConnected) {
-      Alert.alert("Not Connected", "Please connect to the ESP32 first.");
-      return;
-    }
-
-    console.log("MANUAL REFRESH schedules requested");
-
-    setRefreshing(true);
+  const refreshAll = async () => {
     try {
-      await getSchedules();
-    } catch (e: any) {
-      Alert.alert(
-        "Schedule Load Failed",
-        e?.message ?? "Failed to refresh schedules from ESP32."
+      setRefreshing(true);
+
+      const schedulesRef = collection(db, "devices", DEVICE_ID, "schedules");
+      const schedulesQuery = query(schedulesRef, orderBy("date", "asc"));
+      const schedulesSnap = await getDocs(schedulesQuery);
+      setSchedules(
+        schedulesSnap.docs.map((item) => ({
+          id: item.id,
+          ...(item.data() as Omit<ScheduleItem, "id">),
+        }))
       );
+
+      const historyRef = collection(db, "devices", DEVICE_ID, "history");
+      const historyQuery = query(historyRef, orderBy("date", "desc"));
+      const historySnap = await getDocs(historyQuery);
+      setHistory(
+        historySnap.docs.map((item) => ({
+          id: item.id,
+          ...(item.data() as Omit<HistoryItem, "id">),
+        }))
+      );
+    } catch (error) {
+      console.error("Refresh error:", error);
+      Alert.alert("Error", "Failed to refresh data.");
     } finally {
       setRefreshing(false);
     }
   };
 
-  const handleSubmit = async () => {
-    if (!isConnected) {
-      Alert.alert("Not Connected", "Please connect to the ESP32 first.");
+  const shadowStyle =
+    Platform.OS === "ios"
+      ? {
+          shadowColor: "#0f172a",
+          shadowOffset: { width: 0, height: 8 },
+          shadowOpacity: 0.08,
+          shadowRadius: 18,
+        }
+      : { elevation: 4 };
+
+  const daysInMonth = getDaysInMonth(currentYear, currentMonth);
+  const firstDay = getFirstDayOfMonth(currentYear, currentMonth);
+
+  const calendarCells = useMemo(() => {
+    const cells: (number | null)[] = [];
+    for (let i = 0; i < firstDay; i++) cells.push(null);
+    for (let day = 1; day <= daysInMonth; day++) cells.push(day);
+    while (cells.length % 7 !== 0) cells.push(null);
+    return cells;
+  }, [daysInMonth, firstDay]);
+
+  const schedulesForSelectedDate = useMemo(() => {
+    return schedules
+      .filter((item) => item.date === selectedDate)
+      .sort((a, b) => {
+        const aTime = Number(a.hour) * 60 + Number(a.minute);
+        const bTime = Number(b.hour) * 60 + Number(b.minute);
+        return aTime - bTime;
+      });
+  }, [schedules, selectedDate]);
+
+  const historyForSelectedDate = useMemo(() => {
+    return history
+      .filter((item) => item.date === selectedDate)
+      .sort((a, b) => {
+        const aTime = Number(a.hour) * 60 + Number(a.minute);
+        const bTime = Number(b.hour) * 60 + Number(b.minute);
+        return aTime - bTime;
+      });
+  }, [history, selectedDate]);
+
+  const scheduledDates = useMemo(() => {
+    return new Set(
+      schedules
+        .filter((item) => {
+          const [year, month] = item.date.split("-").map(Number);
+          return year === currentYear && month === currentMonth + 1;
+        })
+        .map((item) => item.date)
+    );
+  }, [schedules, currentYear, currentMonth]);
+
+  const historyDates = useMemo(() => {
+    return new Set(
+      history
+        .filter((item) => {
+          const [year, month] = item.date.split("-").map(Number);
+          return year === currentYear && month === currentMonth + 1;
+        })
+        .map((item) => item.date)
+    );
+  }, [history, currentYear, currentMonth]);
+
+  const timeValidation = useMemo(() => {
+    const rawHour = Number(hour12);
+    const rawMinute = Number(minute);
+
+    if (!hour12 || Number.isNaN(rawHour) || rawHour < 1 || rawHour > 12) {
+      return { invalid: true, message: "Hour must be between 1 and 12." };
+    }
+
+    if (!minute || Number.isNaN(rawMinute) || rawMinute < 0 || rawMinute > 59) {
+      return { invalid: true, message: "Minute must be between 00 and 59." };
+    }
+
+    const scheduledAt = buildScheduleDateTime(selectedDate, hour12, minute, period);
+    const current = new Date();
+
+    if (scheduledAt.getTime() <= current.getTime()) {
+      return { invalid: true, message: "You cannot set a schedule in the past." };
+    }
+
+    return { invalid: false, message: "" };
+  }, [selectedDate, hour12, minute, period]);
+
+  const openModal = () => {
+    setTitle("");
+    setHour12("6");
+    setMinute("00");
+    setPeriod("AM");
+    setDuration("10");
+    setModalVisible(true);
+  };
+
+  const saveSchedule = async () => {
+    if (!title.trim()) {
+      Alert.alert("Missing title", "Please enter a schedule title.");
       return;
     }
 
-    if (!validateForm()) return;
-    if (formData.id === null) return;
+    if (timeValidation.invalid) {
+      Alert.alert("Invalid time", timeValidation.message);
+      return;
+    }
 
-    setSaving(true);
+    const safeDuration = Math.max(1, Number(duration) || 1);
+    const { hour24, minute24 } = convertTo24Hour(hour12, minute, period);
+    const scheduleId = makeScheduleId(selectedDate, hour24, minute24);
+
     try {
-      const date = new Date(formData.selectedDate);
-      date.setSeconds(0);
-      date.setMilliseconds(0);
+      setSaving(true);
 
-      console.log("HANDLE SUBMIT selectedDate raw =>", formData.selectedDate);
-      console.log("HANDLE SUBMIT selectedDate info =>", {
-        toString: formData.selectedDate.toString(),
-        iso: formData.selectedDate.toISOString(),
-        hour: formData.selectedDate.getHours(),
-        minute: formData.selectedDate.getMinutes(),
-        formatted: dayjs(formData.selectedDate).format("YYYY-MM-DD hh:mm:ss A"),
+      await setDoc(doc(db, "devices", DEVICE_ID, "schedules", scheduleId), {
+        scheduleId,
+        title: title.trim(),
+        date: selectedDate,
+        hour: hour24,
+        minute: minute24,
+        duration: String(safeDuration),
+        mode: "AUTO",
+        enabled: true,
+        status: "PENDING",
+        createdAt: Date.now(),
       });
-
-      console.log("HANDLE SUBMIT normalized date =>", {
-        toString: date.toString(),
-        iso: date.toISOString(),
-        hour: date.getHours(),
-        minute: date.getMinutes(),
-        formatted: dayjs(date).format("YYYY-MM-DD hh:mm:ss A"),
-      });
-
-      const payload = {
-        id: formData.id,
-        year: formData.repeatDaily ? 0 : date.getFullYear(),
-        month: formData.repeatDaily ? 0 : date.getMonth() + 1,
-        day: formData.repeatDaily ? 0 : date.getDate(),
-        hour: date.getHours(),
-        minute: date.getMinutes(),
-        repeatDaily: formData.repeatDaily,
-        enabled: formData.enabled,
-        durationMs: Number(formData.durationSec) * 1000,
-      };
-
-      console.log("HANDLE SUBMIT payload to send =>", payload);
-
-      const existing = schedules.some((s) => s.id === formData.id);
-
-      console.log("HANDLE SUBMIT existing schedule? =>", existing);
-
-      if (existing) {
-        console.log("CALL editSchedule(payload)");
-        await editSchedule(payload);
-      } else {
-        console.log("CALL addSchedule(payload)");
-        await addSchedule(payload);
-      }
-
-      console.log("WAIT then reload schedules from ESP");
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      await getSchedules();
 
       setModalVisible(false);
-      Alert.alert("Success", "Schedule saved.");
-    } catch (e: any) {
-      console.log("HANDLE SUBMIT error =>", e);
-      Alert.alert(
-        "Save Failed",
-        e?.message ?? "Failed to save schedule to ESP32."
-      );
+      setActiveTab("saved");
+    } catch (error) {
+      console.error("Save schedule error:", error);
+      Alert.alert("Error", "Failed to save schedule.");
     } finally {
       setSaving(false);
     }
   };
 
-  const handleDelete = (id: number) => {
-    Alert.alert("Delete Schedule", `Remove schedule ID ${id}?`, [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Delete",
-        style: "destructive",
-        onPress: async () => {
-          if (!isConnected) {
-            Alert.alert("Not Connected", "Please connect to the ESP32 first.");
-            return;
-          }
-
-          console.log("DELETE schedule id =>", id);
-
-          setDeletingId(id);
-          try {
-            await deleteSchedule(id);
-            await new Promise((resolve) => setTimeout(resolve, 300));
-            await getSchedules();
-            Alert.alert("Deleted", "Schedule removed from ESP32.");
-          } catch (e: any) {
-            console.log("DELETE error =>", e);
-            Alert.alert(
-              "Delete Failed",
-              e?.message ?? "Failed to remove schedule from ESP32."
-            );
-          } finally {
-            setDeletingId(null);
-          }
-        },
-      },
-    ]);
-  };
-
-  const handleClearAll = () => {
-    Alert.alert("Clear All Schedules", "Remove all schedules from the ESP32?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Clear All",
-        style: "destructive",
-        onPress: async () => {
-          console.log("CLEAR ALL schedules");
-          try {
-            await clearSchedules();
-            await new Promise((resolve) => setTimeout(resolve, 300));
-            await getSchedules();
-            Alert.alert("Cleared", "All schedules removed.");
-          } catch (e: any) {
-            console.log("CLEAR ALL error =>", e);
-            Alert.alert(
-              "Clear Failed",
-              e?.message ?? "Failed to clear schedules."
-            );
-          }
-        },
-      },
-    ]);
-  };
-
-  const onChangeDate = (event: DateTimePickerEvent, selected?: Date) => {
-    console.log("DATE PICKER event =>", event.type);
-    console.log("DATE PICKER selected raw =>", selected);
-
-    if (Platform.OS === "android") {
-      setShowDatePicker(false);
-    }
-
-    if (event.type !== "set" || !selected) return;
-
-    console.log("DATE PICKER selected info =>", {
-      toString: selected.toString(),
-      iso: selected.toISOString(),
-      year: selected.getFullYear(),
-      month: selected.getMonth() + 1,
-      day: selected.getDate(),
-    });
-
-    setFormData((prev) => {
-      const next = new Date(prev.selectedDate);
-
-      next.setFullYear(
-        selected.getFullYear(),
-        selected.getMonth(),
-        selected.getDate()
-      );
-
-      console.log("DATE PICKER merged result =>", {
-        previous: prev.selectedDate.toString(),
-        next: next.toString(),
-        hour: next.getHours(),
-        minute: next.getMinutes(),
-        formatted: dayjs(next).format("YYYY-MM-DD hh:mm:ss A"),
+  const toggleEnabled = async (id: string, currentValue: boolean) => {
+    try {
+      await updateDoc(doc(db, "devices", DEVICE_ID, "schedules", id), {
+        enabled: !currentValue,
       });
-
-      return {
-        ...prev,
-        selectedDate: next,
-      };
-    });
-  };
-
-  const onChangeTime = (event: DateTimePickerEvent, selected?: Date) => {
-    console.log("TIME PICKER event =>", event.type);
-    console.log("TIME PICKER selected raw =>", selected);
-
-    if (Platform.OS === "android") {
-      setShowTimePicker(false);
+    } catch (error) {
+      console.error("Toggle schedule error:", error);
+      Alert.alert("Error", "Failed to update schedule.");
     }
-
-    if (event.type !== "set" || !selected) return;
-
-    console.log("TIME PICKER selected info =>", {
-      toString: selected.toString(),
-      iso: selected.toISOString(),
-      hour: selected.getHours(),
-      minute: selected.getMinutes(),
-      formatted: dayjs(selected).format("YYYY-MM-DD hh:mm:ss A"),
-    });
-
-    setFormData((prev) => {
-      const next = new Date(prev.selectedDate);
-
-      next.setHours(selected.getHours());
-      next.setMinutes(selected.getMinutes());
-      next.setSeconds(0);
-      next.setMilliseconds(0);
-
-      console.log("TIME PICKER merged result =>", {
-        previous: prev.selectedDate.toString(),
-        next: next.toString(),
-        hour: next.getHours(),
-        minute: next.getMinutes(),
-        formatted: dayjs(next).format("YYYY-MM-DD hh:mm:ss A"),
-      });
-
-      return {
-        ...prev,
-        selectedDate: next,
-      };
-    });
   };
 
-  const renderEmptyState = () => {
-    if (!isConnected) {
-      return (
-        <View style={styles.emptyContainer}>
-          <View style={styles.emptyIconCircle}>
-            <Feather name="bluetooth" size={32} color="#cbd5e1" />
-          </View>
-          <Text style={styles.emptyText}>Device not connected</Text>
-          <Text style={styles.emptySubText}>
-            Connect to the ESP32 to load and manage schedules.
-          </Text>
-        </View>
-      );
+  const deleteScheduleItem = async (id: string) => {
+    try {
+      await deleteDoc(doc(db, "devices", DEVICE_ID, "schedules", id));
+    } catch (error) {
+      console.error("Delete schedule error:", error);
+      Alert.alert("Error", "Failed to delete schedule.");
     }
-
-    return (
-      <View style={styles.emptyContainer}>
-        <View style={styles.emptyIconCircle}>
-          <Feather name="calendar" size={32} color="#cbd5e1" />
-        </View>
-        <Text style={styles.emptyText}>No schedules loaded</Text>
-        <Text style={styles.emptySubText}>
-          Tap refresh or create a new schedule.
-        </Text>
-      </View>
-    );
   };
+
+  const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
   return (
-    <>
-      <ScrollView
-        style={styles.container}
-        contentContainerStyle={{ paddingBottom: 40 }}
-      >
-        <View style={styles.topBar}>
-          <Text style={styles.pageTitle}>Schedules</Text>
-
-          <TouchableOpacity
-            style={[styles.refreshBtn, refreshing && { opacity: 0.7 }]}
-            onPress={handleRefresh}
-            disabled={refreshing}
-          >
-            {refreshing ? (
-              <ActivityIndicator size="small" color="#2563eb" />
-            ) : (
-              <Feather name="refresh-cw" size={18} color="#2563eb" />
-            )}
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.infoCard}>
-          <Text style={styles.infoTitle}>Schedule Mode</Text>
-          <Text style={styles.infoText}>
-            Create either a daily repeating schedule or a one-time date schedule.
-          </Text>
-          <Text style={styles.infoText}>Duration limit: 1 to 600 seconds</Text>
-          <Text style={styles.infoText}>
-            Connection: {isConnected ? "CONNECTED" : "DISCONNECTED"}
-          </Text>
-          <Text style={styles.infoText}>Last Event: {lastEvent}</Text>
-        </View>
-
-        <View style={styles.actionWrap}>
-          <TouchableOpacity
-            style={[globalStyles.card, styles.newButton]}
-            onPress={openNewModal}
-          >
-            <View style={styles.plusIconWrap}>
-              <FontAwesome5 name="plus" size={16} color="white" />
-            </View>
-            <Text style={styles.newButtonText}>New Schedule</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[globalStyles.card, styles.clearButton]}
-            onPress={handleClearAll}
-          >
-            <View style={styles.clearIconWrap}>
-              <Feather name="trash-2" size={16} color="white" />
-            </View>
-            <Text style={styles.newButtonText}>Clear All</Text>
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.listWrap}>
-          <Text style={styles.sectionTitle}>Saved Schedules</Text>
-
-          {sortedSchedules.length > 0
-            ? sortedSchedules.map((item) => {
-                const displayDate = buildDateFromSchedule(item);
-
-                return (
-                  <TouchableOpacity
-                    key={item.id}
-                    style={styles.scheduleCard}
-                    activeOpacity={0.9}
-                    onPress={() => openEditModal(item)}
-                  >
-                    <View style={styles.timeBox}>
-                      <Text style={styles.timeText}>
-                        {dayjs(displayDate).format("h:mm A")}
-                      </Text>
-
-                      <View
-                        style={[
-                          styles.statusBadge,
-                          {
-                            backgroundColor: item.enabled ? "#dcfce7" : "#f1f5f9",
-                          },
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            styles.statusText,
-                            { color: item.enabled ? "#16a34a" : "#64748b" },
-                          ]}
-                        >
-                          {item.enabled ? "ON" : "OFF"}
-                        </Text>
-                      </View>
-                    </View>
-
-                    <View style={styles.contentBox}>
-                      <Text style={styles.itemTitle}>Schedule ID {item.id}</Text>
-                      <Text style={styles.itemType}>
-                        {item.repeatDaily
-                          ? "Repeats daily"
-                          : `${dayjs(displayDate).format("MMMM D, YYYY")}`}
-                      </Text>
-                      <Text style={styles.itemDesc}>
-                        Runs for {Math.round(item.durationMs / 1000)}s
-                      </Text>
-                    </View>
-
-                    {deletingId === item.id ? (
-                      <ActivityIndicator size="small" color="#ef4444" />
-                    ) : (
-                      <TouchableOpacity
-                        onPress={() => handleDelete(item.id)}
-                        style={styles.deleteButton}
-                        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                      >
-                        <Feather name="trash-2" size={18} color="#ef4444" />
-                      </TouchableOpacity>
-                    )}
-                  </TouchableOpacity>
-                );
-              })
-            : renderEmptyState()}
-        </View>
-      </ScrollView>
-
-      <Modal visible={modalVisible} animationType="slide">
-        <SafeAreaProvider>
-          <SafeAreaView style={styles.modalSafe}>
-            <View style={styles.header}>
-              <Text style={styles.headerText}>
-                {formData.id !== null ? `Schedule ${formData.id}` : "Add Schedule"}
-              </Text>
+    <SafeAreaView className="flex-1 bg-slate-50">
+      <View className="flex-1">
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{ paddingBottom: 120 }}
+          refreshControl={
+            <RefreshControl refreshing={refreshing} onRefresh={refreshAll} />
+          }
+        >
+          <View className="px-4 pt-3">
+            <View className="mb-5 flex-row items-center justify-between">
+              <View className="flex-1 pr-3">
+                <Text className="text-[12px] font-extrabold uppercase tracking-[1.2px] text-slate-400">
+                  Schedule Planner
+                </Text>
+                <Text className="mt-1 text-3xl font-extrabold text-slate-900">
+                  Cleaning Schedule
+                </Text>
+                <Text className="mt-2 text-sm leading-5 text-slate-500">
+                  Saved schedules and executed history for this month.
+                </Text>
+              </View>
 
               <TouchableOpacity
-                onPress={() => setModalVisible(false)}
-                disabled={saving}
+                activeOpacity={0.85}
+                onPress={openModal}
+                className="h-12 w-12 items-center justify-center rounded-2xl bg-slate-900"
               >
-                <FontAwesome5
-                  name="window-close"
-                  size={24}
-                  color={saving ? "#cbd5e1" : "#64748b"}
-                />
+                <Feather name="plus" size={22} color="#fff" />
               </TouchableOpacity>
             </View>
 
-            <KeyboardAvoidingView
-              behavior={Platform.OS === "ios" ? "padding" : undefined}
-              style={{ flex: 1 }}
-            >
-              <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-                <ScrollView contentContainerStyle={styles.form}>
-                  <Text style={styles.label}>Schedule ID</Text>
-                  <View style={styles.readOnlyBox}>
-                    <Text style={styles.readOnlyText}>
-                      {formData.id !== null ? formData.id : "-"}
-                    </Text>
-                  </View>
+            <View className="rounded-[28px] bg-white p-4" style={shadowStyle}>
+              <View className="mb-4 items-center">
+                <Text className="text-lg font-extrabold text-slate-900">
+                  {monthLabel(currentYear, currentMonth)}
+                </Text>
+              </View>
 
-                  <View style={styles.switchRow}>
-                    <Text style={styles.labelNoMargin}>Enabled</Text>
-                    <Switch
-                      value={formData.enabled}
-                      onValueChange={(value) =>
-                        setFormData((prev) => ({ ...prev, enabled: value }))
-                      }
-                      disabled={saving}
-                    />
+              <View className="mb-2 flex-row justify-between">
+                {weekdayLabels.map((label) => (
+                  <View key={label} className="w-[13.5%] items-center">
+                    <Text className="text-xs font-bold text-slate-400">{label}</Text>
                   </View>
+                ))}
+              </View>
 
-                  <View style={styles.switchRow}>
-                    <Text style={styles.labelNoMargin}>Repeat Daily</Text>
-                    <Switch
-                      value={formData.repeatDaily}
-                      onValueChange={(value) =>
-                        setFormData((prev) => ({ ...prev, repeatDaily: value }))
-                      }
-                      disabled={saving}
-                    />
-                  </View>
+              <View className="flex-row flex-wrap justify-between">
+                {calendarCells.map((day, index) => {
+                  if (!day) {
+                    return <View key={`empty-${index}`} className="mb-2 h-14 w-[13.5%]" />;
+                  }
 
-                  {!formData.repeatDaily && (
-                    <>
-                      <Text style={styles.label}>Date</Text>
-                      <TouchableOpacity
-                        style={styles.pickerButton}
-                        onPress={() => setShowDatePicker(true)}
-                        disabled={saving}
+                  const dateString = formatDate(currentYear, currentMonth, day);
+                  const isSelected = selectedDate === dateString;
+                  const hasSchedule = scheduledDates.has(dateString);
+                  const hasHistory = historyDates.has(dateString);
+                  const isTodayCell = dateString === todayString;
+                  const cellDate = new Date(currentYear, currentMonth, day);
+                  const isPastDate = startOfDay(cellDate) < today;
+
+                  return (
+                    <Pressable
+                      key={dateString}
+                      disabled={isPastDate}
+                      onPress={() => setSelectedDate(dateString)}
+                      className={`mb-2 h-14 w-[13.5%] items-center justify-center rounded-2xl ${
+                        isPastDate
+                          ? "bg-slate-50"
+                          : isSelected
+                            ? "bg-slate-900"
+                            : "bg-slate-50"
+                      }`}
+                      style={{ opacity: isPastDate ? 0.45 : 1 }}
+                    >
+                      <Text
+                        className={`text-sm font-bold ${
+                          isPastDate
+                            ? "text-slate-300"
+                            : isSelected
+                              ? "text-white"
+                              : isTodayCell
+                                ? "text-blue-600"
+                                : "text-slate-800"
+                        }`}
                       >
-                        <Feather name="calendar" size={18} color="#2563eb" />
-                        <Text style={styles.pickerButtonText}>
-                          {formatDisplayDate(formData.selectedDate)}
-                        </Text>
-                      </TouchableOpacity>
-                      {!!errors.selectedDate && (
-                        <Text style={styles.error}>{errors.selectedDate}</Text>
-                      )}
-                    </>
-                  )}
+                        {day}
+                      </Text>
 
-                  <Text style={styles.label}>Time</Text>
-                  <TouchableOpacity
-                    style={styles.pickerButton}
-                    onPress={() => setShowTimePicker(true)}
-                    disabled={saving}
-                  >
-                    <Feather name="clock" size={18} color="#2563eb" />
-                    <Text style={styles.pickerButtonText}>
-                      {formatDisplayTime(formData.selectedDate)}
+                      <View className="mt-1 flex-row gap-1">
+                        {hasSchedule && !isPastDate ? (
+                          <View
+                            className={`h-1.5 w-1.5 rounded-full ${
+                              isSelected ? "bg-white" : "bg-blue-500"
+                            }`}
+                          />
+                        ) : null}
+                        {hasHistory && !isPastDate ? (
+                          <View
+                            className={`h-1.5 w-1.5 rounded-full ${
+                              isSelected ? "bg-white" : "bg-emerald-500"
+                            }`}
+                          />
+                        ) : null}
+                      </View>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
+              <Text className="mt-2 text-xs text-slate-400">
+                Blue = saved schedule, green = execution history.
+              </Text>
+            </View>
+
+            <View className="mt-5 flex-row gap-3">
+              <View className="flex-1 rounded-3xl bg-white p-4" style={shadowStyle}>
+                <View className="flex-row items-center">
+                  <View className="h-11 w-11 items-center justify-center rounded-2xl bg-blue-50">
+                    <Ionicons name="calendar-outline" size={20} color="#2563eb" />
+                  </View>
+                  <View className="ml-3">
+                    <Text className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                      Selected Date
                     </Text>
-                  </TouchableOpacity>
+                    <Text className="mt-1 text-base font-extrabold text-slate-900">
+                      {selectedDate}
+                    </Text>
+                  </View>
+                </View>
+              </View>
 
-                  <Text style={styles.label}>Duration (seconds)</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="1 to 600"
-                    keyboardType="number-pad"
-                    value={formData.durationSec}
-                    onChangeText={(t) =>
-                      setFormData((prev) => ({ ...prev, durationSec: t }))
-                    }
-                    editable={!saving}
-                  />
-                  {!!errors.durationSec && (
-                    <Text style={styles.error}>{errors.durationSec}</Text>
-                  )}
+              <View className="flex-1 rounded-3xl bg-white p-4" style={shadowStyle}>
+                <View className="flex-row items-center">
+                  <View className="h-11 w-11 items-center justify-center rounded-2xl bg-emerald-50">
+                    <MaterialCommunityIcons
+                      name="clock-check-outline"
+                      size={20}
+                      color="#10b981"
+                    />
+                  </View>
+                  <View className="ml-3">
+                    <Text className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                      History
+                    </Text>
+                    <Text className="mt-1 text-base font-extrabold text-slate-900">
+                      {historyForSelectedDate.length} item
+                      {historyForSelectedDate.length === 1 ? "" : "s"}
+                    </Text>
+                  </View>
+                </View>
+              </View>
+            </View>
 
-                  <TouchableOpacity
-                    style={[styles.saveButton, saving && { opacity: 0.7 }]}
-                    onPress={handleSubmit}
-                    disabled={saving}
+            <View className="mt-6 rounded-2xl bg-slate-200 p-1">
+              <View className="flex-row">
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => setActiveTab("saved")}
+                  className={`flex-1 rounded-2xl py-3 ${
+                    activeTab === "saved" ? "bg-white" : "bg-transparent"
+                  }`}
+                >
+                  <Text
+                    className={`text-center text-sm font-extrabold ${
+                      activeTab === "saved" ? "text-slate-900" : "text-slate-500"
+                    }`}
                   >
-                    {saving ? (
-                      <ActivityIndicator color="white" />
-                    ) : (
-                      <Text style={styles.saveButtonText}>Save Schedule</Text>
-                    )}
+                    Saved Schedules
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => setActiveTab("history")}
+                  className={`flex-1 rounded-2xl py-3 ${
+                    activeTab === "history" ? "bg-white" : "bg-transparent"
+                  }`}
+                >
+                  <Text
+                    className={`text-center text-sm font-extrabold ${
+                      activeTab === "history" ? "text-slate-900" : "text-slate-500"
+                    }`}
+                  >
+                    History
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {activeTab === "saved" ? (
+              <View className="mt-4">
+                <View className="mb-3 flex-row items-center justify-between">
+                  <Text className="text-[12px] font-extrabold uppercase tracking-[1.2px] text-slate-400">
+                    Saved schedules for {selectedDate}
+                  </Text>
+                  <TouchableOpacity onPress={openModal}>
+                    <Text className="text-sm font-bold text-blue-600">Add Schedule</Text>
                   </TouchableOpacity>
-                </ScrollView>
-              </TouchableWithoutFeedback>
-            </KeyboardAvoidingView>
+                </View>
 
-            {showDatePicker && (
-              <DateTimePicker
-                value={formData.selectedDate}
-                mode="date"
-                display={Platform.OS === "ios" ? "spinner" : "default"}
-                onChange={onChangeDate}
-                minimumDate={new Date()}
-              />
-            )}
+                {loadingSchedules ? (
+                  <View
+                    className="items-center rounded-[28px] bg-white px-5 py-10"
+                    style={shadowStyle}
+                  >
+                    <ActivityIndicator size="large" color="#2563eb" />
+                    <Text className="mt-4 text-sm font-semibold text-slate-500">
+                      Loading schedules...
+                    </Text>
+                  </View>
+                ) : schedulesForSelectedDate.length === 0 ? (
+                  <View
+                    className="items-center rounded-[28px] bg-white px-5 py-10"
+                    style={shadowStyle}
+                  >
+                    <View className="h-16 w-16 items-center justify-center rounded-full bg-slate-100">
+                      <Ionicons name="calendar-clear-outline" size={28} color="#64748b" />
+                    </View>
+                    <Text className="mt-4 text-lg font-extrabold text-slate-900">
+                      No saved schedules
+                    </Text>
+                    <Text className="mt-2 text-center text-sm leading-6 text-slate-500">
+                      Add a cleaning schedule for this selected date.
+                    </Text>
+                  </View>
+                ) : (
+                  schedulesForSelectedDate.map((item) => (
+                    <View
+                      key={item.id}
+                      className="mb-4 rounded-[28px] bg-white p-4"
+                      style={shadowStyle}
+                    >
+                      <View className="flex-row items-start justify-between">
+                        <View className="flex-1 pr-3">
+                          <View className="flex-row items-center">
+                            <View
+                              className={`mr-2 h-2.5 w-2.5 rounded-full ${
+                                item.enabled ? "bg-emerald-500" : "bg-slate-300"
+                              }`}
+                            />
+                            <Text className="text-lg font-extrabold text-slate-900">
+                              {item.title}
+                            </Text>
+                          </View>
 
-            {showTimePicker && (
-              <DateTimePicker
-                value={formData.selectedDate}
-                mode="time"
-                display={Platform.OS === "ios" ? "spinner" : "default"}
-                onChange={onChangeTime}
-                is24Hour={false}
-              />
+                          <Text className="mt-2 text-xs text-slate-400">
+                            ID: {item.scheduleId || item.id}
+                          </Text>
+
+                          <View className="mt-3 flex-row flex-wrap gap-2">
+                            <View className="rounded-full bg-slate-100 px-3 py-1.5">
+                              <Text className="text-xs font-bold text-slate-700">
+                                {formatTo12Hour(item.hour, item.minute)}
+                              </Text>
+                            </View>
+
+                            <View className="rounded-full bg-blue-50 px-3 py-1.5">
+                              <Text className="text-xs font-bold text-blue-700">AUTO</Text>
+                            </View>
+
+                            <View className="rounded-full bg-amber-50 px-3 py-1.5">
+                              <Text className="text-xs font-bold text-amber-700">
+                                {item.duration} min
+                              </Text>
+                            </View>
+
+                            <View className="rounded-full bg-slate-100 px-3 py-1.5">
+                              <Text className="text-xs font-bold text-slate-700">
+                                {item.status}
+                              </Text>
+                            </View>
+                          </View>
+                        </View>
+
+                        <TouchableOpacity
+                          activeOpacity={0.85}
+                          onPress={() => toggleEnabled(item.id, item.enabled)}
+                          className={`rounded-full px-3 py-2 ${
+                            item.enabled ? "bg-emerald-50" : "bg-slate-100"
+                          }`}
+                        >
+                          <Text
+                            className={`text-xs font-extrabold ${
+                              item.enabled ? "text-emerald-700" : "text-slate-600"
+                            }`}
+                          >
+                            {item.enabled ? "Enabled" : "Disabled"}
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+
+                      <View className="mt-4 flex-row items-center justify-between border-t border-slate-100 pt-4">
+                        <Text className="text-sm text-slate-500">
+                          Runs on <Text className="font-bold text-slate-700">{item.date}</Text>
+                        </Text>
+
+                        <TouchableOpacity
+                          activeOpacity={0.85}
+                          onPress={() => deleteScheduleItem(item.id)}
+                          className="flex-row items-center rounded-full bg-red-50 px-3 py-2"
+                        >
+                          <Feather name="trash-2" size={14} color="#dc2626" />
+                          <Text className="ml-2 text-xs font-bold text-red-600">
+                            Delete
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  ))
+                )}
+              </View>
+            ) : (
+              <View className="mt-4">
+                <View className="mb-3">
+                  <Text className="text-[12px] font-extrabold uppercase tracking-[1.2px] text-slate-400">
+                    History for {selectedDate}
+                  </Text>
+                </View>
+
+                {loadingHistory ? (
+                  <View
+                    className="items-center rounded-[28px] bg-white px-5 py-10"
+                    style={shadowStyle}
+                  >
+                    <ActivityIndicator size="large" color="#10b981" />
+                    <Text className="mt-4 text-sm font-semibold text-slate-500">
+                      Loading history...
+                    </Text>
+                  </View>
+                ) : historyForSelectedDate.length === 0 ? (
+                  <View
+                    className="items-center rounded-[28px] bg-white px-5 py-10"
+                    style={shadowStyle}
+                  >
+                    <View className="h-16 w-16 items-center justify-center rounded-full bg-slate-100">
+                      <MaterialCommunityIcons
+                        name="history"
+                        size={28}
+                        color="#64748b"
+                      />
+                    </View>
+                    <Text className="mt-4 text-lg font-extrabold text-slate-900">
+                      No history yet
+                    </Text>
+                    <Text className="mt-2 text-center text-sm leading-6 text-slate-500">
+                      Executed schedules from the ESP will appear here.
+                    </Text>
+                  </View>
+                ) : (
+                  historyForSelectedDate.map((item) => (
+                    <View
+                      key={item.id}
+                      className="mb-4 rounded-[28px] bg-white p-4"
+                      style={shadowStyle}
+                    >
+                      <View className="flex-row items-start justify-between">
+                        <View className="flex-1 pr-3">
+                          <Text className="text-lg font-extrabold text-slate-900">
+                            {item.title}
+                          </Text>
+
+                          <Text className="mt-2 text-xs text-slate-400">
+                            ID: {item.scheduleId || item.id}
+                          </Text>
+
+                          <View className="mt-3 flex-row flex-wrap gap-2">
+                            <View className="rounded-full bg-slate-100 px-3 py-1.5">
+                              <Text className="text-xs font-bold text-slate-700">
+                                {formatTo12Hour(item.hour, item.minute)}
+                              </Text>
+                            </View>
+
+                            <View
+                              className={`rounded-full px-3 py-1.5 ${
+                                item.status === "EXECUTED"
+                                  ? "bg-emerald-50"
+                                  : item.status === "FAILED"
+                                    ? "bg-red-50"
+                                    : "bg-amber-50"
+                              }`}
+                            >
+                              <Text
+                                className={`text-xs font-bold ${
+                                  item.status === "EXECUTED"
+                                    ? "text-emerald-700"
+                                    : item.status === "FAILED"
+                                      ? "text-red-600"
+                                      : "text-amber-700"
+                                }`}
+                              >
+                                {item.status}
+                              </Text>
+                            </View>
+
+                            <View className="rounded-full bg-blue-50 px-3 py-1.5">
+                              <Text className="text-xs font-bold text-blue-700">
+                                {item.duration} min
+                              </Text>
+                            </View>
+                          </View>
+                        </View>
+
+                        <View className="rounded-full bg-slate-100 px-3 py-2">
+                          <Text className="text-xs font-extrabold text-slate-600">
+                            Done
+                          </Text>
+                        </View>
+                      </View>
+
+                      <View className="mt-4 border-t border-slate-100 pt-4">
+                        <Text className="text-sm text-slate-500">
+                          Executed on{" "}
+                          <Text className="font-bold text-slate-700">{item.date}</Text>
+                        </Text>
+                      </View>
+                    </View>
+                  ))
+                )}
+              </View>
             )}
-          </SafeAreaView>
-        </SafeAreaProvider>
-      </Modal>
-    </>
+          </View>
+        </ScrollView>
+
+        <TouchableOpacity
+          activeOpacity={0.9}
+          onPress={openModal}
+          className="absolute bottom-6 right-5 h-16 w-16 items-center justify-center rounded-full bg-slate-900"
+          style={shadowStyle}
+        >
+          <Feather name="plus" size={26} color="#fff" />
+        </TouchableOpacity>
+
+        <Modal visible={modalVisible} animationType="slide" transparent>
+          <View className="flex-1 justify-end bg-black/40">
+            <View className="rounded-t-[32px] bg-white px-5 pb-8 pt-4">
+              <View className="mb-4 items-center">
+                <View className="h-1.5 w-14 rounded-full bg-slate-300" />
+              </View>
+
+              <View className="mb-5 flex-row items-start justify-between">
+                <View className="flex-1 pr-3">
+                  <Text className="text-[12px] font-extrabold uppercase tracking-[1.2px] text-slate-400">
+                    New Schedule
+                  </Text>
+                  <Text className="mt-1 text-2xl font-extrabold text-slate-900">
+                    Add cleaning time
+                  </Text>
+                  <Text className="mt-2 text-sm leading-5 text-slate-500">
+                    Create a schedule for <Text className="font-bold">{selectedDate}</Text>.
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  onPress={() => setModalVisible(false)}
+                  className="h-11 w-11 items-center justify-center rounded-2xl bg-slate-100"
+                >
+                  <Ionicons name="close" size={22} color="#0f172a" />
+                </TouchableOpacity>
+              </View>
+
+              <View className="mb-4">
+                <Text className="mb-2 text-sm font-bold text-slate-700">Title</Text>
+                <TextInput
+                  value={title}
+                  onChangeText={setTitle}
+                  placeholder="Morning cleaning"
+                  placeholderTextColor="#94a3b8"
+                  className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-base text-slate-900"
+                />
+              </View>
+
+              <View className="mb-4">
+                <Text className="mb-2 text-sm font-bold text-slate-700">Time</Text>
+
+                <View className="flex-row gap-3">
+                  <View className="flex-1">
+                    <TextInput
+                      value={hour12}
+                      onChangeText={setHour12}
+                      keyboardType="number-pad"
+                      placeholder="6"
+                      placeholderTextColor="#94a3b8"
+                      className={`rounded-2xl border px-4 py-4 text-base ${
+                        timeValidation.invalid
+                          ? "border-red-500 bg-red-50 text-red-700"
+                          : "border-slate-200 bg-slate-50 text-slate-900"
+                      }`}
+                    />
+                  </View>
+
+                  <View className="w-[26%]">
+                    <TextInput
+                      value={minute}
+                      onChangeText={setMinute}
+                      keyboardType="number-pad"
+                      placeholder="00"
+                      placeholderTextColor="#94a3b8"
+                      className={`rounded-2xl border px-4 py-4 text-base ${
+                        timeValidation.invalid
+                          ? "border-red-500 bg-red-50 text-red-700"
+                          : "border-slate-200 bg-slate-50 text-slate-900"
+                      }`}
+                    />
+                  </View>
+
+                  <View className="w-[28%] flex-row overflow-hidden rounded-2xl bg-slate-100">
+                    <Pressable
+                      onPress={() => setPeriod("AM")}
+                      className={`flex-1 items-center justify-center py-4 ${
+                        period === "AM" ? "bg-slate-900" : "bg-slate-100"
+                      }`}
+                    >
+                      <Text
+                        className={`text-sm font-extrabold ${
+                          period === "AM" ? "text-white" : "text-slate-700"
+                        }`}
+                      >
+                        AM
+                      </Text>
+                    </Pressable>
+
+                    <Pressable
+                      onPress={() => setPeriod("PM")}
+                      className={`flex-1 items-center justify-center py-4 ${
+                        period === "PM" ? "bg-slate-900" : "bg-slate-100"
+                      }`}
+                    >
+                      <Text
+                        className={`text-sm font-extrabold ${
+                          period === "PM" ? "text-white" : "text-slate-700"
+                        }`}
+                      >
+                        PM
+                      </Text>
+                    </Pressable>
+                  </View>
+                </View>
+
+                {timeValidation.invalid ? (
+                  <Text className="mt-2 text-xs font-semibold text-red-500">
+                    {timeValidation.message}
+                  </Text>
+                ) : (
+                  <Text className="mt-2 text-xs text-slate-400">
+                    Example: 6:30 PM
+                  </Text>
+                )}
+              </View>
+
+              <View className="mb-6">
+                <Text className="mb-2 text-sm font-bold text-slate-700">
+                  Duration (minutes)
+                </Text>
+                <TextInput
+                  value={duration}
+                  onChangeText={setDuration}
+                  keyboardType="number-pad"
+                  placeholder="10"
+                  placeholderTextColor="#94a3b8"
+                  className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-base text-slate-900"
+                />
+              </View>
+
+              <View className="flex-row gap-3">
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => setModalVisible(false)}
+                  className="flex-1 items-center rounded-2xl bg-slate-100 py-4"
+                >
+                  <Text className="text-sm font-extrabold text-slate-700">
+                    Cancel
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={saveSchedule}
+                  disabled={saving || timeValidation.invalid}
+                  className={`flex-1 items-center rounded-2xl py-4 ${
+                    saving || timeValidation.invalid ? "bg-blue-400" : "bg-blue-600"
+                  }`}
+                >
+                  {saving ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text className="text-sm font-extrabold text-white">
+                      Save Schedule
+                    </Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+      </View>
+    </SafeAreaView>
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "white",
-  },
-  topBar: {
-    paddingHorizontal: 20,
-    paddingTop: 20,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  pageTitle: {
-    fontSize: 28,
-    fontWeight: "800",
-    color: "#1e293b",
-  },
-  refreshBtn: {
-    width: 42,
-    height: 42,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: "#dbeafe",
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "#eff6ff",
-  },
-  infoCard: {
-    marginHorizontal: 20,
-    marginTop: 18,
-    backgroundColor: "#f8fafc",
-    borderRadius: 20,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: "#e2e8f0",
-  },
-  infoTitle: {
-    fontSize: 16,
-    fontWeight: "800",
-    color: "#1e293b",
-    marginBottom: 8,
-  },
-  infoText: {
-    fontSize: 13,
-    color: "#64748b",
-    marginTop: 2,
-  },
-  actionWrap: {
-    paddingHorizontal: 20,
-    marginTop: 20,
-    gap: 12,
-  },
-  newButton: {
-    paddingVertical: 15,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 12,
-  },
-  clearButton: {
-    paddingVertical: 15,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 12,
-  },
-  plusIconWrap: {
-    padding: 8,
-    backgroundColor: "#22c55e",
-    borderRadius: 10,
-  },
-  clearIconWrap: {
-    padding: 8,
-    backgroundColor: "#ef4444",
-    borderRadius: 10,
-  },
-  newButtonText: {
-    fontWeight: "700",
-    color: "#1e293b",
-  },
-  listWrap: {
-    paddingHorizontal: 20,
-    marginTop: 28,
-  },
-  sectionTitle: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#64748b",
-    marginBottom: 16,
-    textTransform: "uppercase",
-    letterSpacing: 0.5,
-  },
-  scheduleCard: {
-    flexDirection: "row",
-    backgroundColor: "white",
-    borderRadius: 20,
-    padding: 16,
-    marginBottom: 12,
-    alignItems: "center",
-    borderWidth: 1,
-    borderColor: "#f1f5f9",
-    ...Platform.select({
-      ios: {
-        shadowColor: "#000",
-        shadowOffset: { width: 0, height: 2 },
-        shadowOpacity: 0.05,
-        shadowRadius: 10,
-      },
-      android: { elevation: 2 },
-    }),
-  },
-  timeBox: {
-    alignItems: "center",
-    borderRightWidth: 1,
-    borderRightColor: "#f1f5f9",
-    paddingRight: 15,
-    marginRight: 15,
-    minWidth: 90,
-  },
-  timeText: {
-    fontSize: 18,
-    fontWeight: "800",
-    color: "#1e293b",
-  },
-  statusBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 6,
-    marginTop: 4,
-  },
-  statusText: {
-    fontSize: 10,
-    fontWeight: "800",
-  },
-  contentBox: {
-    flex: 1,
-  },
-  itemTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#1e293b",
-  },
-  itemType: {
-    fontSize: 12,
-    color: "#64748b",
-    marginTop: 2,
-  },
-  itemDesc: {
-    fontSize: 12,
-    color: "#94a3b8",
-    marginTop: 4,
-  },
-  deleteButton: {
-    padding: 6,
-    borderRadius: 8,
-    backgroundColor: "#fef2f2",
-    marginLeft: 8,
-  },
-  emptyContainer: {
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 60,
-  },
-  emptyIconCircle: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    backgroundColor: "#f8fafc",
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 16,
-  },
-  emptyText: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#64748b",
-  },
-  emptySubText: {
-    fontSize: 14,
-    color: "#94a3b8",
-    marginTop: 4,
-    textAlign: "center",
-    paddingHorizontal: 20,
-  },
-  modalSafe: {
-    flex: 1,
-    backgroundColor: "white",
-  },
-  header: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    padding: 24,
-    borderBottomWidth: 1,
-    borderBottomColor: "#f1f5f9",
-  },
-  headerText: {
-    fontSize: 22,
-    fontWeight: "800",
-    color: "#1e293b",
-  },
-  form: {
-    padding: 24,
-    gap: 12,
-  },
-  input: {
-    backgroundColor: "#f8fafc",
-    borderWidth: 1,
-    borderColor: "#e2e8f0",
-    borderRadius: 12,
-    padding: 16,
-    fontSize: 16,
-    color: "#1e293b",
-  },
-  readOnlyBox: {
-    backgroundColor: "#f8fafc",
-    borderWidth: 1,
-    borderColor: "#e2e8f0",
-    borderRadius: 12,
-    padding: 16,
-  },
-  readOnlyText: {
-    fontSize: 16,
-    color: "#1e293b",
-    fontWeight: "700",
-  },
-  pickerButton: {
-    backgroundColor: "#f8fafc",
-    borderWidth: 1,
-    borderColor: "#e2e8f0",
-    borderRadius: 12,
-    padding: 16,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-  },
-  pickerButtonText: {
-    fontSize: 16,
-    color: "#1e293b",
-    fontWeight: "600",
-  },
-  label: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#475569",
-    marginTop: 8,
-  },
-  labelNoMargin: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#475569",
-  },
-  switchRow: {
-    marginTop: 8,
-    marginBottom: 4,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  error: {
-    color: "#ef4444",
-    fontSize: 12,
-    fontWeight: "600",
-  },
-  saveButton: {
-    backgroundColor: "#22c55e",
-    paddingVertical: 18,
-    borderRadius: 16,
-    alignItems: "center",
-    justifyContent: "center",
-    marginTop: 20,
-    minHeight: 60,
-    shadowColor: "#22c55e",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.2,
-    shadowRadius: 8,
-    elevation: 4,
-  },
-  saveButtonText: {
-    color: "white",
-    fontSize: 16,
-    fontWeight: "700",
-  },
-});

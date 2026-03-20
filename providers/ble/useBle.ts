@@ -1,5 +1,6 @@
-import { useContext } from 'react';
-import { BleContext } from './BleProvider';
+// useBle.ts
+import {useContext} from 'react';
+import {BleContext} from './BleProvider';
 
 export function useBle() {
   const context = useContext(BleContext);

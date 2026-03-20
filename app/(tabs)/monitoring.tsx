@@ -12,16 +12,17 @@ import {
   View,
 } from "react-native";
 
-import AntDesign from "@expo/vector-icons/AntDesign";
-import Entypo from "@expo/vector-icons/Entypo";
-import Feather from "@expo/vector-icons/Feather";
+import AntDesign  from "@expo/vector-icons/AntDesign";
+import Entypo    from "@expo/vector-icons/Entypo";
+import Feather   from "@expo/vector-icons/Feather";
 import FontAwesome from "@expo/vector-icons/FontAwesome";
 
 import * as Progress from "react-native-progress";
 
 import { useBleCommands } from "@/providers/ble/useBleCommands";
 
-const BIN_FULL_THRESHOLD_G = 500;
+// Bin is "full" at 80 % fill — matches new firmware CHAR_ALERT threshold
+const BIN_FULL_PCT = 80;
 
 type HistoryLikeItem = {
   id: string;
@@ -30,40 +31,29 @@ type HistoryLikeItem = {
   timeText: string;
 };
 
+// ── Icon picker — updated for new firmware alert strings ────────
 function getHistoryIcon(message: string) {
   const msg = (message || "").toLowerCase();
 
-  if (msg.includes("full") || msg.includes("bin")) {
-    return <Entypo name="warning" size={14} color="#f59e0b" />;
-  }
+  // New firmware alert prefixes
+  if (msg.startsWith("bin_full"))  return <Entypo name="warning"       size={14} color="#ef4444" />;
+  if (msg.startsWith("sch_start")) return <Feather name="clock"        size={14} color="#8b5cf6" />;
+  if (msg.startsWith("sch_saved")) return <Feather name="check-square" size={14} color="#10b981" />;
+  if (msg === "motor_done")        return <AntDesign name="check-circle" size={14} color="#16a34a" />;
+  if (msg === "rtc_synced")        return <Feather name="clock"        size={14} color="#06b6d4" />;
 
-  if (msg.includes("conveyor") || msg.includes("motor")) {
-    return <FontAwesome name="gear" size={14} color="#2563eb" />;
-  }
-
-  if (msg.includes("schedule")) {
-    return <Feather name="clock" size={14} color="#8b5cf6" />;
-  }
-
-  if (msg.includes("tare")) {
-    return <Feather name="sliders" size={14} color="#10b981" />;
-  }
-
-  if (msg.includes("time")) {
-    return <Feather name="clock" size={14} color="#06b6d4" />;
-  }
-
-  if (msg.includes("connected") || msg.includes("bluetooth")) {
-    return <Feather name="bluetooth" size={14} color="#06b6d4" />;
-  }
-
-  if (msg.includes("ok") || msg.includes("success")) {
-    return <AntDesign name="check-circle" size={14} color="#16a34a" />;
-  }
+  // Generic keyword fallbacks
+  if (msg.includes("full")  || msg.includes("bin"))       return <Entypo name="warning"      size={14} color="#f59e0b" />;
+  if (msg.includes("conveyor") || msg.includes("motor"))  return <FontAwesome name="gear"    size={14} color="#2563eb" />;
+  if (msg.includes("schedule"))                           return <Feather name="clock"       size={14} color="#8b5cf6" />;
+  if (msg.includes("time")  || msg.includes("clock"))     return <Feather name="clock"       size={14} color="#06b6d4" />;
+  if (msg.includes("connected") || msg.includes("bluetooth")) return <Feather name="bluetooth" size={14} color="#06b6d4" />;
+  if (msg.includes("ok")    || msg.includes("success"))   return <AntDesign name="check-circle" size={14} color="#16a34a" />;
 
   return <Feather name="activity" size={14} color="#64748b" />;
 }
 
+// ── Screen ────────────────────────────────────────────────────
 export default function Monitoring() {
   const { fontScale } = useWindowDimensions();
 
@@ -74,140 +64,90 @@ export default function Monitoring() {
     status,
     mode,
     weight,
+    weightPct,    // NEW — 0–100, replaces manual fillProgress calc
+    motorDir,     // NEW — 'FWD' | 'REV'
+    motorSpeed,   // NEW — 0–255
+    rtcTime,      // NEW — "YYYY-MM-DD HH:mm:ss"
     lastEvent,
     binFullAlert,
-    requestWeight,
-    tareScale,
     syncDeviceTimeNow,
+    // Removed: requestWeight — weight is pushed automatically every 5 s
+    // Removed: tareScale    — not supported in new firmware via BLE
   } = useBleCommands();
 
   const numericWeight = Number(weight || 0);
-  const fillProgress =
-    BIN_FULL_THRESHOLD_G > 0
-      ? Math.min(Math.max(numericWeight / BIN_FULL_THRESHOLD_G, 0), 1)
-      : 0;
+  const binIsFull     = weightPct >= BIN_FULL_PCT;
 
+  // ── Live data monitoring items ────────────────────────────
   const monitoringItems = [
     {
-      label: "Waste Bin Weight",
-      value: !Number.isNaN(numericWeight) ? `${numericWeight.toFixed(1)} g` : "--",
-      sub: `Threshold: ${BIN_FULL_THRESHOLD_G} g`,
-      color: "#22c55e",
-      progress: fillProgress,
+      label:    "Waste Bin Level",
+      value:    isConnected ? `${Math.round(weightPct)}%  (${numericWeight.toFixed(1)} g)` : "--",
+      sub:      `Alert threshold: ${BIN_FULL_PCT}%`,
+      color:    binIsFull ? "#ef4444" : weightPct >= 50 ? "#f59e0b" : "#22c55e",
+      progress: weightPct / 100,
     },
     {
-      label: "Conveyor Status",
-      value: status || "--",
-      sub: "Current conveyor state",
-      color: "#3b82f6",
-      progress:
-        String(status).toUpperCase() === "RUNNING"
-          ? 1
-          : String(status).toUpperCase() === "STOPPED"
-          ? 0.15
-          : 0,
+      label:    "Conveyor Status",
+      value:    status || "--",
+      sub:      "Current conveyor state",
+      color:    "#3b82f6",
+      progress: status === "RUNNING" ? 1 : status === "STOPPED" ? 0.15 : 0,
     },
     {
-      label: "Operating Mode",
-      value: mode || "--",
-      sub: "Manual or Auto",
-      color: "#f59e0b",
-      progress:
-        String(mode).toUpperCase() === "AUTO"
-          ? 1
-          : String(mode).toUpperCase() === "MANUAL"
-          ? 0.5
-          : 0,
+      label:    "Motor Speed",      // NEW — replaces Operating Mode here; mode stays in quick grid
+      value:    isConnected && status === "RUNNING" ? `${motorSpeed}  ·  ${motorDir}` : "--",
+      sub:      "Speed (0–255) and direction",
+      color:    "#8b5cf6",
+      progress: isConnected && status === "RUNNING" ? motorSpeed / 255 : 0,
+    },
+    {
+      label:    "Operating Mode",
+      value:    mode || "--",
+      sub:      "AUTO fires from schedules",
+      color:    "#f59e0b",
+      progress: mode === "AUTO" ? 1 : mode === "MANUAL" ? 0.5 : 0,
     },
   ];
 
+  // ── Activity feed ──────────────────────────────────────────
   const combinedHistory: HistoryLikeItem[] = [
     ...(binFullAlert
-      ? [
-          {
-            id: "bin_alert",
-            icon: getHistoryIcon(binFullAlert),
-            details: binFullAlert,
-            timeText: "Latest",
-          },
-        ]
+      ? [{ id: "bin_alert", icon: getHistoryIcon(binFullAlert), details: binFullAlert, timeText: "Latest" }]
       : []),
     ...(lastEvent
-      ? [
-          {
-            id: "last_event",
-            icon: getHistoryIcon(lastEvent),
-            details: lastEvent,
-            timeText: "Just now",
-          },
-        ]
+      ? [{ id: "last_event", icon: getHistoryIcon(lastEvent), details: lastEvent, timeText: "Just now" }]
       : []),
   ];
 
-  const handleTare = async () => {
-    if (!isConnected) {
-      Alert.alert("Not Connected", "Please connect to the ESP32 first.");
-      return;
-    }
-
-    Alert.alert(
-      "Tare Load Cell",
-      "Make sure the bin/load cell is empty before taring.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Tare",
-          onPress: async () => {
-            try {
-              await tareScale();
-              Alert.alert("Success", "Tare command sent.");
-            } catch (e: any) {
-              Alert.alert(
-                "Tare Failed",
-                e?.message ?? "Failed to tare load cell."
-              );
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  const handleRefresh = async () => {
-    if (!isConnected) {
-      Alert.alert("Not Connected", "Please connect to the ESP32 first.");
-      return;
-    }
-
-    try {
-      await requestWeight();
-    } catch (e: any) {
-      Alert.alert(
-        "Refresh Failed",
-        e?.message ?? "Failed to refresh weight."
-      );
-    }
-  };
-
+  // ── Handlers ──────────────────────────────────────────────
   const handleSyncTime = async () => {
     if (!isConnected) {
       Alert.alert("Not Connected", "Please connect to the ESP32 first.");
       return;
     }
-
     try {
       await syncDeviceTimeNow();
       Alert.alert("Success", "Device time synced.");
     } catch (e: any) {
-      Alert.alert(
-        "Sync Failed",
-        e?.message ?? "Failed to sync device time."
-      );
+      Alert.alert("Sync Failed", e?.message ?? "Failed to sync device time.");
     }
   };
 
+  // Weight and status refresh automatically — inform the user if they tap refresh
+  const handleRefreshInfo = () => {
+    Alert.alert(
+      "Auto Refresh Active",
+      "Weight updates every 5 s and status every 10 s automatically while connected."
+    );
+  };
+
+  // ── Render ─────────────────────────────────────────────────
   return (
-    <ScrollView style={styles.container} contentContainerStyle={{ paddingBottom: 40 }}>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={{ paddingBottom: 40 }}
+    >
       <View
         style={{
           paddingHorizontal: 20,
@@ -216,6 +156,7 @@ export default function Monitoring() {
           gap: 20,
         }}
       >
+        {/* ── Page header ──────────────────────────────── */}
         <View style={{ gap: 4 }}>
           <Text style={[styles.pageTitle, { fontSize: 24 * fontScale }]}>
             Monitoring
@@ -225,6 +166,7 @@ export default function Monitoring() {
           </Text>
         </View>
 
+        {/* ── Offline warning ───────────────────────────── */}
         {!isConnected && (
           <View style={styles.warningCard}>
             {isScanning ? (
@@ -242,6 +184,7 @@ export default function Monitoring() {
           </View>
         )}
 
+        {/* ── Machine Status card ───────────────────────── */}
         <View
           style={[
             globalStyles.card,
@@ -256,18 +199,10 @@ export default function Monitoring() {
               <FontAwesome
                 name="circle"
                 size={14}
-                color={
-                  String(status).toUpperCase() === "RUNNING"
-                    ? "#22c55e"
-                    : isConnected
-                    ? "#94a3b8"
-                    : "#6b7280"
-                }
+                color={status === "RUNNING" ? "#22c55e" : isConnected ? "#94a3b8" : "#6b7280"}
               />
               <Text style={styles.statusMainText}>
-                {String(status).toUpperCase() === "RUNNING"
-                  ? "Conveyor Running"
-                  : "Conveyor Stopped"}
+                {status === "RUNNING" ? "Conveyor Running" : "Conveyor Stopped"}
               </Text>
             </View>
             <Text style={styles.statusValueText}>{status || "--"}</Text>
@@ -278,16 +213,40 @@ export default function Monitoring() {
               <FontAwesome
                 name="circle"
                 size={14}
-                color={numericWeight >= BIN_FULL_THRESHOLD_G ? "#ef4444" : "#22c55e"}
+                color={binIsFull ? "#ef4444" : "#22c55e"}
               />
               <Text style={styles.statusMainText}>
-                {numericWeight >= BIN_FULL_THRESHOLD_G
-                  ? "Waste Bin Full"
-                  : "Waste Bin OK"}
+                {binIsFull ? "Waste Bin Full" : "Waste Bin OK"}
               </Text>
             </View>
             <Text style={styles.statusValueText}>
-              {!Number.isNaN(numericWeight) ? `${numericWeight.toFixed(1)} g` : "--"}
+              {isConnected ? `${Math.round(weightPct)}%` : "--"}
+            </Text>
+          </View>
+
+          {/* NEW — direction row */}
+          <View style={styles.statusRow}>
+            <View style={styles.statusLeft}>
+              <Feather
+                name={motorDir === "REV" ? "arrow-left" : "arrow-right"}
+                size={14}
+                color={status === "RUNNING" ? "#3b82f6" : "#94a3b8"}
+              />
+              <Text style={styles.statusMainText}>Direction</Text>
+            </View>
+            <Text style={styles.statusValueText}>
+              {isConnected && status === "RUNNING" ? motorDir : "--"}
+            </Text>
+          </View>
+
+          {/* NEW — speed row */}
+          <View style={styles.statusRow}>
+            <View style={styles.statusLeft}>
+              <Feather name="zap" size={14} color={status === "RUNNING" ? "#f59e0b" : "#94a3b8"} />
+              <Text style={styles.statusMainText}>Speed</Text>
+            </View>
+            <Text style={styles.statusValueText}>
+              {isConnected && status === "RUNNING" ? String(motorSpeed) : "--"}
             </Text>
           </View>
 
@@ -296,13 +255,24 @@ export default function Monitoring() {
               <FontAwesome
                 name="circle"
                 size={14}
-                color={String(mode).toUpperCase() === "AUTO" ? "#3b82f6" : "#94a3b8"}
+                color={mode === "AUTO" ? "#3b82f6" : "#94a3b8"}
               />
               <Text style={styles.statusMainText}>
-                {String(mode).toUpperCase() === "AUTO" ? "Auto Mode" : "Manual Mode"}
+                {mode === "AUTO" ? "Auto Mode" : "Manual Mode"}
               </Text>
             </View>
             <Text style={styles.statusValueText}>{mode || "--"}</Text>
+          </View>
+
+          {/* NEW — device clock row */}
+          <View style={styles.statusRow}>
+            <View style={styles.statusLeft}>
+              <Feather name="clock" size={14} color="#64748b" />
+              <Text style={styles.statusMainText}>Device Clock</Text>
+            </View>
+            <Text style={[styles.statusValueText, { fontSize: 11 }]}>
+              {isConnected && rtcTime ? rtcTime : "--"}
+            </Text>
           </View>
 
           <View style={styles.statusRowNoBorder}>
@@ -316,6 +286,7 @@ export default function Monitoring() {
           </View>
         </View>
 
+        {/* ── Live Device Data card ─────────────────────── */}
         <View
           style={[
             globalStyles.card,
@@ -330,7 +301,7 @@ export default function Monitoring() {
           {monitoringItems.map((item, index) => (
             <View key={index} style={{ marginTop: index === 0 ? 0 : 16 }}>
               <View style={styles.dataRow}>
-                <View>
+                <View style={{ flex: 1, paddingRight: 12 }}>
                   <Text style={styles.dataLabel}>{item.label}</Text>
                   <Text style={styles.dataSub}>{item.sub}</Text>
                 </View>
@@ -351,27 +322,8 @@ export default function Monitoring() {
             </View>
           ))}
 
-          <TouchableOpacity
-            style={[
-              styles.actionButton,
-              !isConnected && styles.actionButtonDisabled,
-            ]}
-            onPress={handleRefresh}
-            disabled={!isConnected}
-          >
-            <Text style={styles.actionButtonText}>Refresh Weight</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[
-              styles.tareButton,
-              !isConnected && styles.tareButtonDisabled,
-            ]}
-            onPress={handleTare}
-            disabled={!isConnected}
-          >
-            <Text style={styles.tareButtonText}>Tare Load Cell</Text>
-          </TouchableOpacity>
+          {/* Removed: Refresh Weight button — auto-pushed every 5 s  */}
+          {/* Removed: Tare Load Cell button — not in new firmware BLE */}
 
           <TouchableOpacity
             style={[
@@ -384,35 +336,40 @@ export default function Monitoring() {
             <Text style={styles.secondaryButtonText}>Sync Device Time</Text>
           </TouchableOpacity>
 
-          <Text style={styles.tareHint}>
-            Only tare when the bin/load cell is empty.
+          <Text style={styles.hintText}>
+            Weight and status refresh automatically every 5–10 s while connected.
           </Text>
         </View>
 
+        {/* ── Quick grid ────────────────────────────────── */}
         <View style={styles.quickGrid}>
           <View style={[globalStyles.card, styles.quickCard]}>
             <Text style={styles.quickLabel}>Bin Full</Text>
             <Text
               style={[
                 styles.quickValue,
-                { color: numericWeight >= BIN_FULL_THRESHOLD_G ? "#ef4444" : "#16a34a" },
+                { color: binIsFull ? "#ef4444" : "#16a34a" },
               ]}
             >
-              {numericWeight >= BIN_FULL_THRESHOLD_G ? "YES" : "NO"}
+              {isConnected ? (binIsFull ? "YES" : "NO") : "--"}
+            </Text>
+            <Text style={styles.quickSub}>
+              {isConnected ? `${Math.round(weightPct)}%` : ""}
             </Text>
           </View>
 
+          {/* NEW — Direction (replaces "Auto Mode") */}
           <View style={[globalStyles.card, styles.quickCard]}>
-            <Text style={styles.quickLabel}>Auto Mode</Text>
+            <Text style={styles.quickLabel}>Direction</Text>
             <Text style={styles.quickValue}>
-              {String(mode).toUpperCase() === "AUTO" ? "ON" : "OFF"}
+              {isConnected && status === "RUNNING" ? motorDir : "--"}
             </Text>
           </View>
 
           <View style={[globalStyles.card, styles.quickCard]}>
             <Text style={styles.quickLabel}>Conveyor</Text>
             <Text style={styles.quickValue}>
-              {String(status).toUpperCase() === "RUNNING" ? "RUNNING" : "STOPPED"}
+              {status === "RUNNING" ? "RUNNING" : "STOPPED"}
             </Text>
           </View>
 
@@ -424,12 +381,13 @@ export default function Monitoring() {
           </View>
         </View>
 
+        {/* ── Recent Activity ───────────────────────────── */}
         <View style={[globalStyles.card, styles.historyCard]}>
           <View style={styles.historyHeader}>
             <Text style={styles.sectionHeading}>Recent Activity</Text>
-
-            <TouchableOpacity onPress={handleRefresh}>
-              <Feather name="refresh-cw" size={18} color="#64748b" />
+            {/* Refresh is now informational since data is auto-pushed */}
+            <TouchableOpacity onPress={handleRefreshInfo}>
+              <Feather name="info" size={18} color="#64748b" />
             </TouchableOpacity>
           </View>
 
@@ -464,14 +422,8 @@ const styles = StyleSheet.create({
     backgroundColor: "white",
   },
 
-  pageTitle: {
-    fontWeight: "800",
-    color: "#1e293b",
-  },
-  pageSubtitle: {
-    color: "#94a3b8",
-    fontWeight: "600",
-  },
+  pageTitle:    { fontWeight: "800", color: "#1e293b" },
+  pageSubtitle: { color: "#94a3b8", fontWeight: "600" },
 
   warningCard: {
     flexDirection: "row",
@@ -483,24 +435,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#fde68a",
   },
-  warningText: {
-    color: "#92400e",
-    fontSize: 14,
-    fontWeight: "600",
-    flex: 1,
-  },
+  warningText: { color: "#92400e", fontSize: 14, fontWeight: "600", flex: 1 },
 
-  machineCard: {
-    paddingHorizontal: 18,
-    paddingVertical: 18,
-    gap: 2,
-  },
-  sectionHeading: {
-    fontSize: 18,
-    fontWeight: "800",
-    color: "#1e293b",
-    marginBottom: 12,
-  },
+  machineCard: { paddingHorizontal: 18, paddingVertical: 18, gap: 2 },
+
+  sectionHeading: { fontSize: 18, fontWeight: "800", color: "#1e293b", marginBottom: 12 },
+
   statusRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -515,139 +455,41 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     paddingVertical: 12,
   },
-  statusLeft: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    flex: 1,
-  },
-  statusMainText: {
-    fontSize: 15,
-    fontWeight: "700",
-    color: "#1e293b",
-  },
-  statusValueText: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#64748b",
-    marginLeft: 10,
-    maxWidth: "40%",
-    textAlign: "right",
-  },
+  statusLeft:      { flexDirection: "row", alignItems: "center", gap: 10, flex: 1 },
+  statusMainText:  { fontSize: 15, fontWeight: "700", color: "#1e293b" },
+  statusValueText: { fontSize: 13, fontWeight: "700", color: "#64748b", marginLeft: 10, maxWidth: "40%", textAlign: "right" },
 
-  dataCard: {
-    paddingHorizontal: 18,
-    paddingVertical: 18,
-  },
+  dataCard: { paddingHorizontal: 18, paddingVertical: 18 },
   dataRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
     marginBottom: 8,
   },
-  dataLabel: {
-    fontSize: 15,
-    fontWeight: "700",
-    color: "#1e293b",
-  },
-  dataSub: {
-    fontSize: 12,
-    color: "#94a3b8",
-    marginTop: 2,
-  },
-  dataValue: {
-    fontSize: 15,
-    fontWeight: "800",
-    color: "#1e293b",
-  },
-
-  actionButton: {
-    backgroundColor: "#2563eb",
-    paddingVertical: 14,
-    borderRadius: 14,
-    alignItems: "center",
-    marginTop: 18,
-  },
-  actionButtonDisabled: {
-    backgroundColor: "#94a3b8",
-  },
-  actionButtonText: {
-    color: "white",
-    fontWeight: "700",
-    fontSize: 16,
-  },
-
-  tareButton: {
-    backgroundColor: "#10b981",
-    paddingVertical: 14,
-    borderRadius: 14,
-    alignItems: "center",
-    marginTop: 12,
-  },
-  tareButtonDisabled: {
-    backgroundColor: "#94a3b8",
-  },
-  tareButtonText: {
-    color: "white",
-    fontWeight: "700",
-    fontSize: 16,
-  },
+  dataLabel: { fontSize: 15, fontWeight: "700", color: "#1e293b" },
+  dataSub:   { fontSize: 12, color: "#94a3b8", marginTop: 2 },
+  dataValue: { fontSize: 15, fontWeight: "800", color: "#1e293b" },
 
   secondaryButton: {
     backgroundColor: "#1e293b",
     paddingVertical: 14,
     borderRadius: 14,
     alignItems: "center",
-    marginTop: 12,
+    marginTop: 18,
   },
-  secondaryButtonDisabled: {
-    backgroundColor: "#94a3b8",
-  },
-  secondaryButtonText: {
-    color: "white",
-    fontWeight: "700",
-    fontSize: 16,
-  },
+  secondaryButtonDisabled: { backgroundColor: "#94a3b8" },
+  secondaryButtonText:     { color: "white", fontWeight: "700", fontSize: 16 },
 
-  tareHint: {
-    marginTop: 10,
-    fontSize: 12,
-    color: "#64748b",
-    textAlign: "center",
-  },
+  hintText: { marginTop: 10, fontSize: 12, color: "#64748b", textAlign: "center" },
 
-  quickGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 12,
-  },
-  quickCard: {
-    width: "47%",
-    paddingHorizontal: 16,
-    paddingVertical: 16,
-  },
-  quickLabel: {
-    fontSize: 13,
-    color: "#64748b",
-    fontWeight: "600",
-  },
-  quickValue: {
-    fontSize: 16,
-    fontWeight: "800",
-    color: "#1e293b",
-    marginTop: 6,
-  },
+  quickGrid: { flexDirection: "row", flexWrap: "wrap", gap: 12 },
+  quickCard: { width: "47%", paddingHorizontal: 16, paddingVertical: 16 },
+  quickLabel: { fontSize: 13, color: "#64748b", fontWeight: "600" },
+  quickValue: { fontSize: 16, fontWeight: "800", color: "#1e293b", marginTop: 6 },
+  quickSub:   { fontSize: 11, color: "#94a3b8", marginTop: 2 },
 
-  historyCard: {
-    paddingHorizontal: 18,
-    paddingVertical: 18,
-  },
-  historyHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
-  },
+  historyCard:   { paddingHorizontal: 18, paddingVertical: 18 },
+  historyHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
   historyRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -657,32 +499,10 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: "#f8fafc",
   },
-  historyLeft: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    flex: 1,
-    paddingRight: 10,
-  },
-  historyIconWrap: {
-    width: 24,
-    alignItems: "center",
-  },
-  historyText: {
-    fontWeight: "600",
-    color: "#1e293b",
-    flex: 1,
-  },
-  historyTime: {
-    color: "#94a3b8",
-    fontWeight: "600",
-  },
-  emptyWrap: {
-    paddingVertical: 20,
-    alignItems: "center",
-  },
-  emptyText: {
-    color: "#94a3b8",
-    fontWeight: "600",
-  },
+  historyLeft:    { flexDirection: "row", alignItems: "center", gap: 10, flex: 1, paddingRight: 10 },
+  historyIconWrap:{ width: 24, alignItems: "center" },
+  historyText:    { fontWeight: "600", color: "#1e293b", flex: 1 },
+  historyTime:    { color: "#94a3b8", fontWeight: "600" },
+  emptyWrap:      { paddingVertical: 20, alignItems: "center" },
+  emptyText:      { color: "#94a3b8", fontWeight: "600" },
 });

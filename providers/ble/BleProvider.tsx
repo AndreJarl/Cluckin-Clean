@@ -1,3 +1,4 @@
+// BleProvider.tsx
 import React, {
   createContext,
   useCallback,
@@ -15,13 +16,26 @@ import {
 } from 'react-native-ble-plx';
 import {BleContextValue, BleMode, CleaningSchedule} from './bleTypes';
 import {
-  buildScheduleCommand,
+  buildGetSchedulesCommand,
+  buildMotorFwdCommand,
+  buildMotorOffCommand,
+  buildMotorOnCommand,
+  buildMotorRevCommand,
+  buildRemoveScheduleCommand,
+  buildSetScheduleCmd,
+  buildSetServoCommand,
   buildSetTimeCommand,
-  CMD_UUID,
+  buildTimedRunCommand,
+  CHAR_ALERT,
+  CHAR_MOTOR,
+  CHAR_RTC_SYNC,
+  CHAR_SCHEDULE,
+  CHAR_SERVO,
+  CHAR_STATUS,
+  CHAR_WEIGHT,
   decodeBase64,
   DEVICE_NAME,
   encodeBase64,
-  NOTIFY_UUID,
   requestBlePermissions,
   SERVICE_UUID,
 } from './bleHelpers';
@@ -29,349 +43,345 @@ import {
 export const BleContext = createContext<BleContextValue | null>(null);
 
 export function BleProvider({children}: {children: React.ReactNode}) {
-  const managerRef = useRef<BleManager | null>(null);
-  const notifySubRef = useRef<Subscription | null>(null);
+  const managerRef       = useRef<BleManager | null>(null);
+  const notifySubsRef    = useRef<Subscription[]>([]);
   const disconnectSubRef = useRef<Subscription | null>(null);
-  const scanTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scanTimeoutRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const destroyedRef     = useRef(false);
+  // deviceRef mirrors device state but updates SYNCHRONOUSLY.
+  // writeToChar reads this ref so it never closes over a stale null
+  // when called right after setDevice() inside scanAndConnect.
+  const deviceRef        = useRef<Device | null>(null);
 
-  const pendingSchedulesRef = useRef<CleaningSchedule[]>([]);
-  const expectedScheduleCountRef = useRef<number | null>(null);
-
-  const [bleReady, setBleReady] = useState(false);
-  const [isScanning, setIsScanning] = useState(false);
-  const [device, setDevice] = useState<Device | null>(null);
-  const [status, setStatus] = useState('DISCONNECTED');
-  const [mode, setMode] = useState<BleMode>('AUTO');
-  const [weight, setWeight] = useState('0.0');
-  const [lastEvent, setLastEvent] = useState('Idle');
+  const [bleReady,    setBleReady]    = useState(false);
+  const [isScanning,  setIsScanning]  = useState(false);
+  const [device,      setDevice]      = useState<Device | null>(null);
+  const [status,      setStatus]      = useState('DISCONNECTED');
+  const [mode,        setMode]        = useState<BleMode>('MANUAL');
+  const [weight,      setWeight]      = useState('0.0');
+  const [weightPct,   setWeightPct]   = useState(0);
+  const [motorDir,    setMotorDir]    = useState<'FWD' | 'REV'>('FWD');
+  const [motorSpeed,  setMotorSpeed]  = useState(200);
+  const [rtcTime,     setRtcTime]     = useState('');
+  const [lastEvent,   setLastEvent]   = useState('Idle');
   const [binFullAlert, setBinFullAlert] = useState<string | null>(null);
-  const [schedules, setSchedules] = useState<CleaningSchedule[]>([]);
+  const [schedules,   setSchedules]   = useState<CleaningSchedule[]>([]);
 
+  // ── BleManager lifecycle ────────────────────────────────────
   useEffect(() => {
     const manager = new BleManager();
     managerRef.current = manager;
+    destroyedRef.current = false;
 
-    const sub = manager.onStateChange((state: State) => {
+    const stateSub = manager.onStateChange((state: State) => {
       setBleReady(state === State.PoweredOn);
     }, true);
 
     return () => {
-      sub.remove();
-      notifySubRef.current?.remove();
-      disconnectSubRef.current?.remove();
+      stateSub.remove();
+      cleanupAllSubs();
 
       if (scanTimeoutRef.current) {
         clearTimeout(scanTimeoutRef.current);
+        scanTimeoutRef.current = null;
       }
 
-      manager.destroy();
+      const m = managerRef.current;
       managerRef.current = null;
+      if (m && !destroyedRef.current) {
+        destroyedRef.current = true;
+        m.destroy().catch(e => console.log('BleManager destroy =>', e));
+      }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const cleanupSubscriptions = useCallback(() => {
-    notifySubRef.current?.remove();
-    notifySubRef.current = null;
-
+  // ── Cleanup helpers ─────────────────────────────────────────
+  const cleanupAllSubs = useCallback(() => {
+    notifySubsRef.current.forEach(s => s.remove());
+    notifySubsRef.current = [];
     disconnectSubRef.current?.remove();
     disconnectSubRef.current = null;
   }, []);
 
-  const resetScheduleCollection = useCallback(() => {
-    pendingSchedulesRef.current = [];
-    expectedScheduleCountRef.current = null;
-  }, []);
-
-  const handleNotifyMessage = useCallback((message: string) => {
-    const parts = message.split(',');
-    const type = parts[0];
-
-    switch (type) {
-      case 'CONVEYOR_ON':
-        setStatus('RUNNING');
-        setLastEvent('Conveyor started');
-        return;
-
-      case 'CONVEYOR_OFF':
-        setStatus('STOPPED');
-        setLastEvent('Conveyor stopped');
-        return;
-
-      case 'AUTO_MODE':
-        setMode('AUTO');
-        setLastEvent('Auto mode enabled');
-        return;
-
-      case 'STATUS':
-        setMode((parts[1] as BleMode) || 'AUTO');
-        setStatus(parts[2] || 'UNKNOWN');
-        setLastEvent(`Status: ${parts[1] || '-'} / ${parts[2] || '-'}`);
-        return;
-
-      case 'WEIGHT':
-        setWeight(parts[1] || '0.0');
-        return;
-
-      case 'TARE_OK':
-        setWeight('0.0');
-        setLastEvent('Scale tared');
-        return;
-
-      case 'TIME_SET_OK':
-        setLastEvent('Device time synced');
-        return;
-
-      case 'TIME_SET_ERROR':
-        setLastEvent('Device time sync failed');
-        return;
-
-      case 'BIN_FULL':
-        setWeight(parts[1] || '0.0');
-        setBinFullAlert(`Waste bin full: ${parts[1] || '?'} g`);
-        setLastEvent('Waste bin threshold exceeded');
-        return;
-
-      case 'SCHEDULE_TRIGGERED':
-        setLastEvent(
-          `Schedule ${parts[1] || '?'} triggered on ${parts[2] || '-'} ${parts[3] || '-'}`,
-        );
-        return;
-
-      case 'ADD_SCHEDULE_OK':
-      case 'EDIT_SCHEDULE_OK':
-      case 'DELETE_SCHEDULE_OK':
-      case 'CLEAR_SCHEDULES_OK':
-        setLastEvent(message);
-        return;
-
-      case 'ADD_SCHEDULE_ERROR':
-      case 'EDIT_SCHEDULE_ERROR':
-      case 'DELETE_SCHEDULE_ERROR':
-      case 'ERROR':
-        setLastEvent(message);
-        return;
-
-      case 'SCHEDULE_COUNT': {
-        const count = Number(parts[1] || 0);
-        expectedScheduleCountRef.current = count;
-        pendingSchedulesRef.current = [];
-
-        if (count === 0) {
-          setSchedules([]);
-          setLastEvent('No schedules saved');
-        }
-        return;
-      }
-
-      case 'SCHEDULE': {
-        const schedule: CleaningSchedule = {
-          id: Number(parts[1] || 0),
-          year: Number(parts[2] || 0),
-          month: Number(parts[3] || 0),
-          day: Number(parts[4] || 0),
-          hour: Number(parts[5] || 0),
-          minute: Number(parts[6] || 0),
-          repeatDaily: parts[7] === '1',
-          enabled: parts[8] === '1',
-          durationMs: Number(parts[9] || 0),
-        };
-
-        pendingSchedulesRef.current = [...pendingSchedulesRef.current, schedule];
-
-        const expected = expectedScheduleCountRef.current;
-        if (
-          typeof expected === 'number' &&
-          pendingSchedulesRef.current.length >= expected
-        ) {
-          setSchedules([...pendingSchedulesRef.current]);
-          setLastEvent(`Loaded ${pendingSchedulesRef.current.length} schedules`);
-        }
-        return;
-      }
-
-      default:
-        setLastEvent(message);
-    }
-  }, []);
-
-  const monitorNotifications = useCallback(
-    (connectedDevice: Device) => {
-      const manager = managerRef.current;
-      if (!manager) {
-        throw new Error('BLE manager not initialized');
-      }
-
-      notifySubRef.current?.remove();
-
-      notifySubRef.current = manager.monitorCharacteristicForDevice(
-        connectedDevice.id,
-        SERVICE_UUID,
-        NOTIFY_UUID,
-        (error, characteristic: Characteristic | null) => {
-          if (error) {
-            setLastEvent(`Notify error: ${error.message}`);
-            return;
-          }
-
-          if (!characteristic?.value) return;
-
-          const decoded = decodeBase64(characteristic.value);
-          handleNotifyMessage(decoded);
-        },
-      );
-    },
-    [handleNotifyMessage],
-  );
-
-  const watchDisconnect = useCallback(
-    (connectedDevice: Device) => {
-      const manager = managerRef.current;
-      if (!manager) {
-        throw new Error('BLE manager not initialized');
-      }
-
-      disconnectSubRef.current?.remove();
-
-      disconnectSubRef.current = manager.onDeviceDisconnected(
-        connectedDevice.id,
-        error => {
-          cleanupSubscriptions();
-          setDevice(null);
-          setStatus('DISCONNECTED');
-
-          if (error) {
-            setLastEvent(`Disconnected: ${error.message}`);
-          } else {
-            setLastEvent('Disconnected');
-          }
-        },
-      );
-    },
-    [cleanupSubscriptions],
-  );
-
-  const sendCommand = useCallback(
-    async (command: string) => {
-      const manager = managerRef.current;
-      if (!manager || !device) {
+  // ── Low-level: write to a specific characteristic ───────────
+  // Uses deviceRef (not device state) so it works immediately after
+  // setDevice() is called — React state updates are async/batched.
+  const writeToChar = useCallback(
+    async (charUUID: string, command: string) => {
+      const manager     = managerRef.current;
+      const currentDevice = deviceRef.current;   // ← ref, always up-to-date
+      if (!manager || !currentDevice) {
         throw new Error('No BLE device connected');
       }
-
+      console.log(`[BLE] → ${charUUID.slice(-4)} | ${command}`);
       await manager.writeCharacteristicWithResponseForDevice(
-        device.id,
+        currentDevice.id,
         SERVICE_UUID,
-        CMD_UUID,
+        charUUID,
         encodeBase64(command),
       );
     },
-    [device],
+    [], // no dependency on device state — reads ref directly
   );
 
-  const requestStatus = useCallback(async () => {
-    await sendCommand('STATUS');
-  }, [sendCommand]);
+  // ── Low-level: add a notify subscription for one characteristic ─
+  const addMonitor = useCallback(
+    (connectedDevice: Device, charUUID: string, onValue: (v: string) => void) => {
+      const manager = managerRef.current;
+      if (!manager) return;
 
-  const requestWeight = useCallback(async () => {
-    await sendCommand('WEIGHT?');
-  }, [sendCommand]);
-
-  const tareScale = useCallback(async () => {
-    await sendCommand('TARE');
-  }, [sendCommand]);
-
-  const startConveyor = useCallback(async () => {
-    await sendCommand('START');
-  }, [sendCommand]);
-
-  const stopConveyor = useCallback(async () => {
-    await sendCommand('STOP');
-  }, [sendCommand]);
-
-  const setAutoMode = useCallback(async () => {
-    await sendCommand('AUTO');
-  }, [sendCommand]);
-
-  const setDeviceTime = useCallback(
-    async (date: Date = new Date()) => {
-      await sendCommand(buildSetTimeCommand(date));
+      const sub = manager.monitorCharacteristicForDevice(
+        connectedDevice.id,
+        SERVICE_UUID,
+        charUUID,
+        (error, characteristic: Characteristic | null) => {
+          if (error) {
+            console.log(`[BLE] monitor error (${charUUID.slice(-4)}) =>`, error.message);
+            return;
+          }
+          if (!characteristic?.value) return;
+          const decoded = decodeBase64(characteristic.value);
+          console.log(`[BLE] ← ${charUUID.slice(-4)} | ${decoded}`);
+          onValue(decoded);
+        },
+      );
+      notifySubsRef.current.push(sub);
     },
-    [sendCommand],
+    [],
   );
 
-  const syncDeviceTimeNow = useCallback(async () => {
-    await setDeviceTime(new Date());
-  }, [setDeviceTime]);
+  // ── Notification handlers ───────────────────────────────────
 
-  const getSchedules = useCallback(async () => {
-    resetScheduleCollection();
-    await sendCommand('GET_SCHEDULES');
-  }, [resetScheduleCollection, sendCommand]);
+  /** {"g":1234.5,"pct":24.7} */
+  const handleWeight = useCallback((raw: string) => {
+    try {
+      const obj = JSON.parse(raw);
+      const g   = Number(obj.g   ?? 0);
+      const pct = Number(obj.pct ?? 0);
+      setWeight(g.toFixed(1));
+      setWeightPct(Math.min(100, Math.max(0, pct)));
+      if (pct >= 80) {
+        setBinFullAlert(`Bin ${pct.toFixed(0)}% full — ${g.toFixed(0)} g`);
+      } else {
+        setBinFullAlert(null);
+      }
+    } catch (e) {
+      console.log('[BLE] weight parse error =>', e, raw);
+    }
+  }, []);
 
-  const clearSchedules = useCallback(async () => {
-    await sendCommand('CLEAR_SCHEDULES');
-    setSchedules([]);
-    resetScheduleCollection();
-  }, [resetScheduleCollection, sendCommand]);
+  /** Plain alert strings: "BIN_FULL:87%", "SCH_START:2", "MOTOR_DONE", etc. */
+  const handleAlert = useCallback((raw: string) => {
+    const msg = raw.trim();
+    setLastEvent(msg);
+
+    if (msg.startsWith('BIN_FULL')) {
+      setBinFullAlert(msg.replace('BIN_FULL:', 'Bin full — '));
+    } else if (msg === 'MOTOR_DONE') {
+      setStatus(prev => (prev === 'RUNNING' ? 'STOPPED' : prev));
+      setMode('MANUAL');
+    } else if (msg.startsWith('SCH_START')) {
+      setMode('AUTO');
+      setStatus('RUNNING');
+    } else if (msg.startsWith('SCH_SAVED') || msg === 'RTC_SYNCED') {
+      // informational — lastEvent is already set
+    }
+  }, []);
+
+  /** {"motor":true,"spd":200,"dir":"FWD","time":"2025-06-01 08:00:00"} */
+  const handleStatus = useCallback((raw: string) => {
+    try {
+      const obj = JSON.parse(raw);
+      const running = !!obj.motor;
+      setStatus(running ? 'RUNNING' : 'STOPPED');
+      setMotorDir((obj.dir === 'REV' ? 'REV' : 'FWD') as 'FWD' | 'REV');
+      setMotorSpeed(Number(obj.spd ?? 200));
+      if (obj.time) setRtcTime(String(obj.time));
+    } catch (e) {
+      console.log('[BLE] status parse error =>', e, raw);
+    }
+  }, []);
+
+  /**
+   * Schedule list from ESP32:
+   * [{"id":0,"hour":8,"min":0,"days":126,"dur":60,"en":true}, …]
+   *
+   * Maps firmware field names → CleaningSchedule type:
+   *   id   → index
+   *   min  → minute
+   *   days → daysMask
+   *   dur  → durationSec
+   *   en   → enabled
+   */
+  const handleSchedules = useCallback((raw: string) => {
+    try {
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return;
+      const parsed: CleaningSchedule[] = arr.map((item: any) => ({
+        index      : Number(item.id    ?? item.index ?? 0),
+        hour       : Number(item.hour  ?? 0),
+        minute     : Number(item.min   ?? item.minute ?? 0),
+        daysMask   : Number(item.days  ?? item.daysMask ?? 0),
+        durationSec: Number(item.dur   ?? item.durationSec ?? 0),
+        enabled    : Boolean(item.en   ?? item.enabled ?? false),
+      }));
+      console.log('[BLE] parsed schedules =>', parsed);
+      setSchedules(parsed);
+      setLastEvent(`Loaded ${parsed.length} schedules`);
+    } catch (e) {
+      console.log('[BLE] schedule parse error =>', e, raw);
+    }
+  }, []);
+
+  // ── Wire up all notify subscriptions after connecting ────────
+  const monitorAllCharacteristics = useCallback(
+    (connectedDevice: Device) => {
+      addMonitor(connectedDevice, CHAR_WEIGHT,   handleWeight);
+      addMonitor(connectedDevice, CHAR_ALERT,    handleAlert);
+      addMonitor(connectedDevice, CHAR_STATUS,   handleStatus);
+      addMonitor(connectedDevice, CHAR_SCHEDULE, handleSchedules);
+    },
+    [addMonitor, handleWeight, handleAlert, handleStatus, handleSchedules],
+  );
+
+  // ── Watch for unexpected disconnection ───────────────────────
+  const watchDisconnect = useCallback(
+    (connectedDevice: Device) => {
+      const manager = managerRef.current;
+      if (!manager) return;
+
+      disconnectSubRef.current?.remove();
+      disconnectSubRef.current = manager.onDeviceDisconnected(
+        connectedDevice.id,
+        error => {
+          cleanupAllSubs();
+          deviceRef.current = null;   // clear ref on unexpected drop
+          setSchedules([]);
+          setDevice(null);
+          setStatus('DISCONNECTED');
+          setRtcTime('');
+          setLastEvent(error ? `Disconnected: ${error.message}` : 'Disconnected');
+        },
+      );
+    },
+    [cleanupAllSubs],
+  );
+
+  // ── Motor commands ───────────────────────────────────────────
+  const startConveyor = useCallback(
+    async (speed = 200) => writeToChar(CHAR_MOTOR, buildMotorOnCommand(speed)),
+    [writeToChar],
+  );
+
+  const stopConveyor = useCallback(
+    async () => writeToChar(CHAR_MOTOR, buildMotorOffCommand()),
+    [writeToChar],
+  );
+
+  const motorFwd = useCallback(
+    async () => writeToChar(CHAR_MOTOR, buildMotorFwdCommand()),
+    [writeToChar],
+  );
+
+  const motorRev = useCallback(
+    async () => writeToChar(CHAR_MOTOR, buildMotorRevCommand()),
+    [writeToChar],
+  );
+
+  const runTimed = useCallback(
+    async (secs: number, speed = 200) =>
+      writeToChar(CHAR_MOTOR, buildTimedRunCommand(secs, speed)),
+    [writeToChar],
+  );
+
+  // ── Servo ────────────────────────────────────────────────────
+  const setServo = useCallback(
+    async (angle: number) => writeToChar(CHAR_SERVO, buildSetServoCommand(angle)),
+    [writeToChar],
+  );
+
+  // ── Clock ────────────────────────────────────────────────────
+  const setDeviceTime = useCallback(
+    async (date: Date = new Date()) =>
+      writeToChar(CHAR_RTC_SYNC, buildSetTimeCommand(date)),
+    [writeToChar],
+  );
+
+  const syncDeviceTimeNow = useCallback(
+    async () => setDeviceTime(new Date()),
+    [setDeviceTime],
+  );
+
+  // ── Schedules ─────────────────────────────────────────────────
+  const getSchedules = useCallback(
+    async () => writeToChar(CHAR_SCHEDULE, buildGetSchedulesCommand()),
+    [writeToChar],
+  );
 
   const addSchedule = useCallback(
     async (schedule: CleaningSchedule) => {
-      await sendCommand(buildScheduleCommand('ADD_SCHEDULE', schedule));
-      await new Promise(resolve => setTimeout(resolve, 150));
+      await writeToChar(CHAR_SCHEDULE, buildSetScheduleCmd(schedule));
+      await new Promise(r => setTimeout(r, 120));
       await getSchedules();
     },
-    [getSchedules, sendCommand],
+    [writeToChar, getSchedules],
   );
 
   const editSchedule = useCallback(
     async (schedule: CleaningSchedule) => {
-      await sendCommand(buildScheduleCommand('EDIT_SCHEDULE', schedule));
-      await new Promise(resolve => setTimeout(resolve, 150));
+      await writeToChar(CHAR_SCHEDULE, buildSetScheduleCmd(schedule));
+      await new Promise(r => setTimeout(r, 120));
       await getSchedules();
     },
-    [getSchedules, sendCommand],
+    [writeToChar, getSchedules],
   );
 
   const deleteSchedule = useCallback(
-    async (id: number) => {
-      await sendCommand(`DELETE_SCHEDULE,${id}`);
-      await new Promise(resolve => setTimeout(resolve, 150));
+    async (index: number) => {
+      await writeToChar(CHAR_SCHEDULE, buildRemoveScheduleCommand(index));
+      await new Promise(r => setTimeout(r, 120));
       await getSchedules();
     },
-    [getSchedules, sendCommand],
+    [writeToChar, getSchedules],
   );
 
+  const clearSchedules = useCallback(async () => {
+    for (const s of schedules) {
+      await writeToChar(CHAR_SCHEDULE, buildRemoveScheduleCommand(s.index));
+      await new Promise(r => setTimeout(r, 80));
+    }
+    await getSchedules();
+  }, [schedules, writeToChar, getSchedules]);
+
+  // ── Disconnect ────────────────────────────────────────────────
   const disconnect = useCallback(async () => {
     const manager = managerRef.current;
-    if (!manager || !device) return;
-
-    cleanupSubscriptions();
-
+    if (!manager || !deviceRef.current) return;
+    cleanupAllSubs();
+    setSchedules([]);
     try {
-      await manager.cancelDeviceConnection(device.id);
-    } catch {
-      // ignore
+      await manager.cancelDeviceConnection(deviceRef.current.id);
+    } catch (e) {
+      console.log('cancelDeviceConnection =>', e);
     }
-
+    deviceRef.current = null;   // clear ref before state
     setDevice(null);
     setStatus('DISCONNECTED');
+    setRtcTime('');
     setLastEvent('Disconnected');
-  }, [cleanupSubscriptions, device]);
+  }, [cleanupAllSubs]);
 
+  // ── Scan and connect ──────────────────────────────────────────
   const scanAndConnect = useCallback(async () => {
     const manager = managerRef.current;
-    if (!manager) {
-      throw new Error('BLE manager not initialized');
-    }
+    if (!manager) throw new Error('BLE manager not initialized');
 
     const granted = await requestBlePermissions();
-    if (!granted) {
-      throw new Error('Bluetooth permissions not granted');
-    }
+    if (!granted) throw new Error('Bluetooth permissions not granted');
 
     const state = await manager.state();
-    if (state !== State.PoweredOn) {
-      throw new Error('Bluetooth is not powered on');
-    }
+    if (state !== State.PoweredOn) throw new Error('Bluetooth is not powered on');
 
     if (device) {
       setLastEvent('Already connected');
@@ -379,24 +389,21 @@ export function BleProvider({children}: {children: React.ReactNode}) {
     }
 
     setIsScanning(true);
-    setLastEvent('Scanning for ESP32...');
+    setLastEvent(`Scanning for ${DEVICE_NAME}…`);
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
 
-      const finish = (callback: () => void) => {
+      const finish = (cb: () => void) => {
         if (settled) return;
         settled = true;
-
         manager.stopDeviceScan();
-
         if (scanTimeoutRef.current) {
           clearTimeout(scanTimeoutRef.current);
           scanTimeoutRef.current = null;
         }
-
         setIsScanning(false);
-        callback();
+        cb();
       };
 
       scanTimeoutRef.current = setTimeout(() => {
@@ -409,79 +416,79 @@ export function BleProvider({children}: {children: React.ReactNode}) {
           return;
         }
 
-        const name = scannedDevice?.name || scannedDevice?.localName;
+        const name = scannedDevice?.name ?? scannedDevice?.localName;
         if (name !== DEVICE_NAME) return;
 
-   finish(async () => {
-    try {
-      if (!scannedDevice) {
-        throw new Error('Scanned device is undefined');
-      }
+        finish(async () => {
+          try {
+            if (!scannedDevice) throw new Error('Scanned device is undefined');
 
-      const connected = await scannedDevice.connect();
-      const discovered =
-        await connected.discoverAllServicesAndCharacteristics();
+            const connected  = await scannedDevice.connect();
+            const discovered = await connected.discoverAllServicesAndCharacteristics();
 
-      setDevice(discovered);
-      setStatus('CONNECTED');
-      setLastEvent(`Connected to ${name}`);
+            // Update ref FIRST (synchronous) so writeToChar can use it
+            // immediately. setDevice() triggers a re-render but is async.
+            deviceRef.current = discovered;
+            setDevice(discovered);
+            setStatus('CONNECTED');
+            setLastEvent(`Connected to ${name}`);
 
-      monitorNotifications(discovered);
-      watchDisconnect(discovered);
+            // Wire up all notifications
+            monitorAllCharacteristics(discovered);
+            watchDisconnect(discovered);
 
-      await new Promise(resolve => setTimeout(resolve, 150));
+            // Sync RTC immediately
+            await new Promise(r => setTimeout(r, 200));
+            await syncDeviceTimeNow();
 
-      await syncDeviceTimeNow();
-      await new Promise(resolve => setTimeout(resolve, 120));
+            // Request initial schedules
+            // (status + weight come in automatically via notify)
+            await new Promise(r => setTimeout(r, 120));
+            await writeToChar(CHAR_SCHEDULE, buildGetSchedulesCommand());
 
-      await requestStatus();
-      await new Promise(resolve => setTimeout(resolve, 120));
-
-      await requestWeight();
-      await new Promise(resolve => setTimeout(resolve, 120));
-
-      await getSchedules();
-
-      resolve();
-    } catch (e) {
-      reject(e);
-    }
-  });
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
+        });
       });
     });
   }, [
     device,
-    getSchedules,
-    monitorNotifications,
-    requestStatus,
-    requestWeight,
-    syncDeviceTimeNow,
+    monitorAllCharacteristics,
     watchDisconnect,
+    syncDeviceTimeNow,
+    writeToChar,
   ]);
 
+  // ── Context value ─────────────────────────────────────────────
   const value = useMemo<BleContextValue>(
     () => ({
       bleReady,
       isScanning,
-      isConnected: !!device,
+      isConnected : !!device,
       device,
       status,
       mode,
       weight,
+      weightPct,
+      motorDir,
+      motorSpeed,
+      rtcTime,
       lastEvent,
       binFullAlert,
       schedules,
 
       scanAndConnect,
       disconnect,
-      sendCommand,
 
-      requestStatus,
-      requestWeight,
-      tareScale,
       startConveyor,
       stopConveyor,
-      setAutoMode,
+      motorFwd,
+      motorRev,
+      runTimed,
+
+      setServo,
 
       setDeviceTime,
       syncDeviceTimeNow,
@@ -493,31 +500,13 @@ export function BleProvider({children}: {children: React.ReactNode}) {
       clearSchedules,
     }),
     [
-      bleReady,
-      isScanning,
-      device,
-      status,
-      mode,
-      weight,
-      lastEvent,
-      binFullAlert,
-      schedules,
-      scanAndConnect,
-      disconnect,
-      sendCommand,
-      requestStatus,
-      requestWeight,
-      tareScale,
-      startConveyor,
-      stopConveyor,
-      setAutoMode,
-      setDeviceTime,
-      syncDeviceTimeNow,
-      addSchedule,
-      editSchedule,
-      deleteSchedule,
-      getSchedules,
-      clearSchedules,
+      bleReady, isScanning, device, status, mode, weight, weightPct,
+      motorDir, motorSpeed, rtcTime, lastEvent, binFullAlert, schedules,
+      scanAndConnect, disconnect,
+      startConveyor, stopConveyor, motorFwd, motorRev, runTimed,
+      setServo,
+      setDeviceTime, syncDeviceTimeNow,
+      addSchedule, editSchedule, deleteSchedule, getSchedules, clearSchedules,
     ],
   );
 

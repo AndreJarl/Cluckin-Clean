@@ -15,6 +15,8 @@ import { LineChart } from "react-native-chart-kit";
 import BleStatusIndicator from "@/providers/ble/BleStatusIndicator";
 import { useBleCommands } from "@/providers/ble/useBleCommands";
 
+// ── Shared components ─────────────────────────────────────────
+
 const GlassCard = ({ children, style }: any) => (
   <View
     style={[
@@ -44,17 +46,15 @@ const ActionButton = ({
   icon: keyof typeof Feather.glyphMap;
   onPress: () => void;
   disabled?: boolean;
-  variant?: "primary" | "secondary" | "danger";
+  variant?: "primary" | "secondary" | "danger" | "success";
 }) => {
   const backgroundColor =
-    variant === "danger"
-      ? "#ef4444"
-      : variant === "secondary"
-        ? "#1e293b"
-        : "#3b82f6";
+    variant === "danger"   ? "#ef4444" :
+    variant === "success"  ? "#22c55e" :
+    variant === "secondary"? "#1e293b" :
+    "#3b82f6";
 
-  const borderColor =
-    variant === "secondary" ? "#334155" : "transparent";
+  const borderColor = variant === "secondary" ? "#334155" : "transparent";
 
   return (
     <Pressable
@@ -82,16 +82,78 @@ const ActionButton = ({
   );
 };
 
+// ── Status row helper ─────────────────────────────────────────
+const StatusRow = ({
+  label,
+  value,
+  valueColor,
+}: {
+  label: string;
+  value: string;
+  valueColor?: string;
+}) => (
+  <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+    <Text style={{ color: "#94a3b8", fontSize: 13 }}>{label}</Text>
+    <Text style={{ color: valueColor ?? "#f8fafc", fontWeight: "700", maxWidth: "55%", textAlign: "right" }}>
+      {value}
+    </Text>
+  </View>
+);
+
+// ── Bin level bar ─────────────────────────────────────────────
+const BinLevelBar = ({ pct }: { pct: number }) => {
+  const clamped  = Math.min(100, Math.max(0, pct));
+  const barColor = clamped >= 80 ? "#ef4444" : clamped >= 50 ? "#f59e0b" : "#22c55e";
+  return (
+    <View style={{ marginTop: 10 }}>
+      <View style={{ flexDirection: "row", justifyContent: "space-between", marginBottom: 6 }}>
+        <Text style={{ color: "#94a3b8", fontSize: 12 }}>Fill level</Text>
+        <Text style={{ color: barColor, fontWeight: "800", fontSize: 13 }}>
+          {Math.round(clamped)}%
+        </Text>
+      </View>
+      <View
+        style={{
+          height: 10,
+          backgroundColor: "rgba(255,255,255,0.08)",
+          borderRadius: 6,
+          overflow: "hidden",
+        }}
+      >
+        <View
+          style={{
+            width: `${clamped}%`,
+            height: "100%",
+            backgroundColor: barColor,
+            borderRadius: 6,
+          }}
+        />
+      </View>
+      {clamped >= 80 && (
+        <Text style={{ color: "#f87171", fontSize: 11, fontWeight: "700", marginTop: 5 }}>
+          ⚠ Bin is full — please empty soon
+        </Text>
+      )}
+    </View>
+  );
+};
+
+// ── Helpers ───────────────────────────────────────────────────
 function getSystemColor(isConnected: boolean) {
   return isConnected ? "#22c55e" : "#ef4444";
 }
 
-function getSystemLabel(isConnected: boolean, bleReady: boolean, isScanning: boolean) {
-  if (!bleReady) return "BLUETOOTH OFF";
-  if (isScanning) return "SCANNING";
+function getSystemLabel(
+  isConnected: boolean,
+  bleReady: boolean,
+  isScanning: boolean
+) {
+  if (!bleReady)   return "BLUETOOTH OFF";
+  if (isScanning)  return "SCANNING";
   return isConnected ? "OPERATIONAL" : "DISCONNECTED";
 }
 
+// ── Screen ────────────────────────────────────────────────────
 export default function Dashboard() {
   const { width, fontScale } = useWindowDimensions();
 
@@ -102,18 +164,26 @@ export default function Dashboard() {
     status,
     mode,
     weight,
+    weightPct,    // NEW — bin fill 0–100
+    motorDir,     // NEW — 'FWD' | 'REV'
+    motorSpeed,   // NEW — 0–255
+    rtcTime,      // NEW — "YYYY-MM-DD HH:mm:ss"
     lastEvent,
     binFullAlert,
     scanAndConnect,
     disconnect,
     startConveyor,
     stopConveyor,
-    setAutoMode,
-    requestWeight,
+    motorFwd,     // NEW — replaces setAutoMode
+    motorRev,     // NEW — replaces requestWeight
     syncDeviceTimeNow,
+    // Removed: setAutoMode (not in new firmware)
+    // Removed: requestWeight (weight is pushed automatically every 5 s)
   } = useBleCommands();
 
   const numericWeight = Number(weight || 0);
+
+  // Chart points: simulated historical fill curve ending at current weight
   const wasteLevelPoints = [
     0,
     Math.max(0, numericWeight * 0.35),
@@ -124,6 +194,7 @@ export default function Dashboard() {
   const systemColor = getSystemColor(isConnected);
   const systemLabel = getSystemLabel(isConnected, bleReady, isScanning);
 
+  // ── Handlers ───────────────────────────────────────────────
   const handleConnect = async () => {
     try {
       await scanAndConnect();
@@ -156,19 +227,22 @@ export default function Dashboard() {
     }
   };
 
-  const handleAuto = async () => {
+  // Replaces handleAuto — sets motor direction to forward
+  const handleFwd = async () => {
     try {
-      await setAutoMode();
+      await motorFwd();
     } catch (e: any) {
-      Alert.alert("Auto Mode Failed", e?.message ?? "Failed to enable auto mode.");
+      Alert.alert("Direction Failed", e?.message ?? "Failed to set forward.");
     }
   };
 
-  const handleRefreshWeight = async () => {
+  // Replaces handleRefreshWeight — sets motor direction to reverse
+  // (weight is now pushed automatically every 5 s; no manual refresh needed)
+  const handleRev = async () => {
     try {
-      await requestWeight();
+      await motorRev();
     } catch (e: any) {
-      Alert.alert("Refresh Failed", e?.message ?? "Failed to get weight.");
+      Alert.alert("Direction Failed", e?.message ?? "Failed to set reverse.");
     }
   };
 
@@ -181,12 +255,14 @@ export default function Dashboard() {
     }
   };
 
+  // ── Render ─────────────────────────────────────────────────
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: "#0f172a" }}>
       <ScrollView
         showsVerticalScrollIndicator={false}
         contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 40 }}
       >
+        {/* ── Header ──────────────────────────────────── */}
         <View
           style={{
             marginTop: 20,
@@ -198,20 +274,12 @@ export default function Dashboard() {
         >
           <View>
             <Text
-              style={{
-                fontSize: 28 * fontScale,
-                fontWeight: "800",
-                color: "#f8fafc",
-              }}
+              style={{ fontSize: 28 * fontScale, fontWeight: "800", color: "#f8fafc" }}
             >
               Dashboard
             </Text>
             <Text
-              style={{
-                fontSize: 14 * fontScale,
-                color: "#94a3b8",
-                marginTop: 4,
-              }}
+              style={{ fontSize: 14 * fontScale, color: "#94a3b8", marginTop: 4 }}
             >
               Smart Chicken Waste Cleaning System
             </Text>
@@ -219,6 +287,7 @@ export default function Dashboard() {
           <BleStatusIndicator />
         </View>
 
+        {/* ── System status pill ──────────────────────── */}
         <View
           style={{
             flexDirection: "row",
@@ -255,97 +324,79 @@ export default function Dashboard() {
           </Text>
         </View>
 
+        {/* ── Device Status card ──────────────────────── */}
         <GlassCard>
           <Text
-            style={{
-              color: "#cbd5e1",
-              fontSize: 14,
-              fontWeight: "600",
-              marginBottom: 16,
-            }}
+            style={{ color: "#cbd5e1", fontSize: 14, fontWeight: "600", marginBottom: 16 }}
           >
             DEVICE STATUS
           </Text>
 
           <View style={{ gap: 14 }}>
-            <View
-              style={{
-                flexDirection: "row",
-                justifyContent: "space-between",
-              }}
-            >
-              <Text style={{ color: "#94a3b8", fontSize: 13 }}>BLE Ready</Text>
-              <Text style={{ color: "#f8fafc", fontWeight: "700" }}>
-                {String(bleReady)}
-              </Text>
-            </View>
-
-            <View
-              style={{
-                flexDirection: "row",
-                justifyContent: "space-between",
-              }}
-            >
-              <Text style={{ color: "#94a3b8", fontSize: 13 }}>Connected</Text>
-              <Text style={{ color: "#f8fafc", fontWeight: "700" }}>
-                {String(isConnected)}
-              </Text>
-            </View>
-
-            <View
-              style={{
-                flexDirection: "row",
-                justifyContent: "space-between",
-              }}
-            >
-              <Text style={{ color: "#94a3b8", fontSize: 13 }}>Scanning</Text>
-              <Text style={{ color: "#f8fafc", fontWeight: "700" }}>
-                {String(isScanning)}
-              </Text>
-            </View>
-
-            <View
-              style={{
-                flexDirection: "row",
-                justifyContent: "space-between",
-              }}
-            >
-              <Text style={{ color: "#94a3b8", fontSize: 13 }}>Conveyor</Text>
-              <Text style={{ color: "#f8fafc", fontWeight: "700" }}>
-                {status}
-              </Text>
-            </View>
-
-            <View
-              style={{
-                flexDirection: "row",
-                justifyContent: "space-between",
-              }}
-            >
-              <Text style={{ color: "#94a3b8", fontSize: 13 }}>Mode</Text>
-              <Text style={{ color: "#f8fafc", fontWeight: "700" }}>
-                {mode}
-              </Text>
-            </View>
+            <StatusRow label="BLE Ready"  value={String(bleReady)} />
+            <StatusRow label="Connected"  value={String(isConnected)} />
+            <StatusRow label="Scanning"   value={String(isScanning)} />
+            <StatusRow
+              label="Conveyor"
+              value={status || "--"}
+              valueColor={status === "RUNNING" ? "#4ade80" : "#94a3b8"}
+            />
+            <StatusRow
+              label="Mode"
+              value={mode || "--"}
+              valueColor={mode === "AUTO" ? "#c084fc" : undefined}
+            />
+            {/* ── NEW fields ── */}
+            <StatusRow
+              label="Direction"
+              value={isConnected && status === "RUNNING" ? motorDir : "--"}
+            />
+            <StatusRow
+              label="Speed"
+              value={isConnected && status === "RUNNING" ? String(motorSpeed) : "--"}
+            />
+            <StatusRow
+              label="Device Clock"
+              value={isConnected && rtcTime ? rtcTime : "--"}
+              valueColor="#64748b"
+            />
           </View>
         </GlassCard>
 
+        {/* ── Waste Bin Level card ─────────────────────── */}
         <GlassCard>
           <View
             style={{
               flexDirection: "row",
               justifyContent: "space-between",
-              marginBottom: 15,
+              marginBottom: 8,
             }}
           >
             <Text style={{ color: "#cbd5e1", fontSize: 14, fontWeight: "600" }}>
               WASTE BIN LEVEL
             </Text>
             <Text style={{ color: "#3b82f6", fontWeight: "700" }}>
-              {weight} g
+              {numericWeight.toFixed(1)} g
             </Text>
           </View>
 
+          {/* Fill bar (new) */}
+          <BinLevelBar pct={weightPct} />
+
+          {/* Historical trend chart */}
+          <Text
+            style={{
+              color: "#475569",
+              fontSize: 11,
+              fontWeight: "600",
+              marginTop: 16,
+              marginBottom: 4,
+              textTransform: "uppercase",
+              letterSpacing: 0.5,
+            }}
+          >
+            Weight trend
+          </Text>
           <LineChart
             data={{
               labels: ["25%", "50%", "75%", "Now"],
@@ -358,7 +409,7 @@ export default function Dashboard() {
               ],
             }}
             width={width - 80}
-            height={180}
+            height={160}
             chartConfig={{
               backgroundGradientFrom: "#1e293b",
               backgroundGradientTo: "#1e293b",
@@ -366,30 +417,23 @@ export default function Dashboard() {
               color: (o = 1) => `rgba(255, 255, 255, ${o})`,
               labelColor: (o = 1) => `rgba(148, 163, 184, ${o})`,
               style: { borderRadius: 16 },
-              propsForDots: {
-                r: "4",
-                strokeWidth: "2",
-                stroke: "#3b82f6",
-              },
+              propsForDots: { r: "4", strokeWidth: "2", stroke: "#3b82f6" },
             }}
             bezier
             style={{ marginVertical: 8, borderRadius: 16, marginLeft: -20 }}
           />
         </GlassCard>
 
+        {/* ── Controls card ────────────────────────────── */}
         <GlassCard>
           <Text
-            style={{
-              color: "#cbd5e1",
-              fontSize: 14,
-              fontWeight: "600",
-              marginBottom: 16,
-            }}
+            style={{ color: "#cbd5e1", fontSize: 14, fontWeight: "600", marginBottom: 16 }}
           >
             CONTROLS
           </Text>
 
           <View style={{ gap: 12 }}>
+            {/* Row 1 — Connection */}
             <View style={{ flexDirection: "row", gap: 12 }}>
               <View style={{ flex: 1 }}>
                 <ActionButton
@@ -410,6 +454,7 @@ export default function Dashboard() {
               </View>
             </View>
 
+            {/* Row 2 — Motor on/off */}
             <View style={{ flexDirection: "row", gap: 12 }}>
               <View style={{ flex: 1 }}>
                 <ActionButton
@@ -417,6 +462,7 @@ export default function Dashboard() {
                   icon="play"
                   onPress={handleStart}
                   disabled={!isConnected}
+                  variant="success"
                 />
               </View>
               <View style={{ flex: 1 }}>
@@ -430,27 +476,37 @@ export default function Dashboard() {
               </View>
             </View>
 
+            {/* Row 3 — Direction (replaces Auto Mode + Refresh Weight) */}
             <View style={{ flexDirection: "row", gap: 12 }}>
               <View style={{ flex: 1 }}>
                 <ActionButton
-                  title="Auto Mode"
-                  icon="repeat"
-                  onPress={handleAuto}
+                  title="Forward"
+                  icon="arrow-right"
+                  onPress={handleFwd}
                   disabled={!isConnected}
-                  variant="secondary"
+                  variant={
+                    isConnected && motorDir === "FWD" && status === "RUNNING"
+                      ? "primary"
+                      : "secondary"
+                  }
                 />
               </View>
               <View style={{ flex: 1 }}>
                 <ActionButton
-                  title="Refresh Weight"
-                  icon="refresh-cw"
-                  onPress={handleRefreshWeight}
+                  title="Reverse"
+                  icon="arrow-left"
+                  onPress={handleRev}
                   disabled={!isConnected}
-                  variant="secondary"
+                  variant={
+                    isConnected && motorDir === "REV" && status === "RUNNING"
+                      ? "primary"
+                      : "secondary"
+                  }
                 />
               </View>
             </View>
 
+            {/* Row 4 — Sync time (full width) */}
             <ActionButton
               title="Sync Device Time"
               icon="clock"
@@ -461,6 +517,7 @@ export default function Dashboard() {
           </View>
         </GlassCard>
 
+        {/* ── Recent Activity ──────────────────────────── */}
         <Text
           style={{
             color: "#f8fafc",
@@ -485,7 +542,9 @@ export default function Dashboard() {
                 borderColor: "rgba(239, 68, 68, 0.2)",
               }}
             >
-              <Text style={{ color: "#f87171", fontWeight: "800", marginBottom: 4 }}>
+              <Text
+                style={{ color: "#f87171", fontWeight: "800", marginBottom: 4 }}
+              >
                 BIN ALERT
               </Text>
               <Text style={{ color: "#fecaca" }}>{binFullAlert}</Text>
@@ -511,13 +570,8 @@ export default function Dashboard() {
             >
               LAST EVENT
             </Text>
-
             <Text
-              style={{
-                color: "#94a3b8",
-                fontSize: 13,
-                lineHeight: 20,
-              }}
+              style={{ color: "#94a3b8", fontSize: 13, lineHeight: 20 }}
               selectable
             >
               {lastEvent || "No recent activity"}
@@ -525,6 +579,7 @@ export default function Dashboard() {
           </View>
         </GlassCard>
 
+        {/* ── Bluetooth waiting indicator ──────────────── */}
         {!bleReady ? (
           <View style={{ marginTop: 8, alignItems: "center" }}>
             <ActivityIndicator color="#3b82f6" />
