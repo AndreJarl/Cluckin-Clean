@@ -1,7 +1,7 @@
 import { Feather, Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   ImageBackground,
   Modal,
@@ -13,32 +13,104 @@ import {
   View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { onValue, ref } from "firebase/database";
 
 import MyAccordion from "@/components/ui/Accordion";
+import { db } from "@/lib/firebase";
+
+type DeviceStatus = {
+  wifiConnected?: boolean;
+  updatedAtMs?: number;
+  conveyor?: {
+    isOn?: boolean;
+    lastChanged?: number;
+  };
+  loadCell?: {
+    raw?: number;
+    loadPresent?: boolean;
+  };
+  ultrasonic?: {
+    distanceCm?: number;
+  };
+  rtc?: {
+    dateTime?: string;
+  };
+};
+
+const DEVICE_ID = "conveyorCleaner01";
 
 export default function HomeScreen() {
   const router = useRouter();
 
   const [helpVisible, setHelpVisible] = useState(false);
   const [deviceDetailsVisible, setDeviceDetailsVisible] = useState(false);
+  const [statusData, setStatusData] = useState<DeviceStatus | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  // TEMP DATA
-  // Later we will replace these with Firebase values
-  const isConnected = true;
-  const connectionLabel = isConnected ? "Online" : "Offline";
+  useEffect(() => {
+    const statusRef = ref(db, `/devices/${DEVICE_ID}/status`);
+
+    const unsubscribe = onValue(
+      statusRef,
+      (snapshot) => {
+        setStatusData(snapshot.val());
+        setLoading(false);
+      },
+      () => {
+        setLoading(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
+
+  const shadowStyle =
+    Platform.OS === "ios"
+      ? {
+          shadowColor: "#0f172a",
+          shadowOffset: { width: 0, height: 10 },
+          shadowOpacity: 0.08,
+          shadowRadius: 18,
+        }
+      : { elevation: 4 };
+
+  const isConnected = !!statusData?.wifiConnected;
+  const connectionLabel = loading
+    ? "Loading..."
+    : isConnected
+    ? "Online"
+    : "Offline";
   const connectionColor = isConnected ? "#10b981" : "#ef4444";
   const connectionBg = isConnected ? "#dcfce7" : "#fee2e2";
 
   const deviceName = "Chicken Cleaner 1";
-  const status = "IDLE";
+  const conveyorOn = !!statusData?.conveyor?.isOn;
+  const loadPresent = !!statusData?.loadCell?.loadPresent;
+  const rawWeight = Number(statusData?.loadCell?.raw ?? 0);
+  const distanceCm = Number(statusData?.ultrasonic?.distanceCm ?? 0);
+  const rtcTime = statusData?.rtc?.dateTime ?? "--";
+  const updatedAtMs = Number(statusData?.updatedAtMs ?? 0);
+
+  const screenStatus = useMemo(() => {
+    if (loading) return "LOADING";
+    if (!isConnected) return "OFFLINE";
+    if (conveyorOn) return "RUNNING";
+    if (loadPresent) return "LOAD DETECTED";
+    return "IDLE";
+  }, [loading, isConnected, conveyorOn, loadPresent]);
+
   const mode = "AUTO";
-  const weight = 8.4;
-  const weightPct = 42;
-  const motorDir = "Forward";
-  const motorSpeed = 75;
-  const rtcTime = "10:24 AM";
-  const lastEvent = "System checked successfully. No recent issues detected.";
-  const binFullAlert = false;
+
+  const weightKgText = "--";
+  const weightPct = loadPresent ? 100 : 0;
+  const motorDir = conveyorOn ? "Forward" : "Stopped";
+  const motorSpeed = conveyorOn ? 100 : 0;
+
+  const lastEvent = loading
+    ? "Loading device status..."
+    : `RTC: ${rtcTime} • Distance: ${distanceCm} cm • HX711 raw: ${rawWeight}`;
+
+  const binFullAlert = loadPresent;
 
   const actions = [
     {
@@ -74,16 +146,6 @@ export default function HomeScreen() {
       path: "/notification",
     },
   ];
-
-  const shadowStyle =
-    Platform.OS === "ios"
-      ? {
-          shadowColor: "#0f172a",
-          shadowOffset: { width: 0, height: 10 },
-          shadowOpacity: 0.08,
-          shadowRadius: 18,
-        }
-      : { elevation: 4 };
 
   return (
     <View className="flex-1 bg-slate-50">
@@ -134,14 +196,18 @@ export default function HomeScreen() {
         </ImageBackground>
 
         <View className="-mt-5 px-4">
-          <View className="rounded-3xl bg-white p-5" style={shadowStyle}>
+          {/* <View className="rounded-3xl bg-white p-5" style={shadowStyle}>
             <View className="flex-row items-start justify-between">
               <View className="flex-1 pr-3">
                 <Text className="text-[12px] font-extrabold uppercase tracking-wider text-slate-400">
                   System Overview
                 </Text>
                 <Text className="mt-1 text-2xl font-extrabold text-slate-900">
-                  {isConnected ? "Device Connected" : "Waiting for Device"}
+                  {loading
+                    ? "Loading Device"
+                    : isConnected
+                    ? "Device Connected"
+                    : "Waiting for Device"}
                 </Text>
               </View>
 
@@ -161,13 +227,13 @@ export default function HomeScreen() {
             <View className="mt-5 flex-row justify-between">
               <View className="w-[31.5%] rounded-2xl bg-slate-50 px-3 py-4 items-center">
                 <Text className="text-lg font-extrabold text-slate-900">
-                  {weight.toFixed(1)} kg
+                  {weightKgText}
                 </Text>
                 <Text className="mt-1 text-[11px] font-bold uppercase tracking-wider text-slate-400">
                   Weight
                 </Text>
                 <Text className="mt-1 text-center text-[11px] text-slate-400">
-                  Current load
+                  Raw: {rawWeight}
                 </Text>
               </View>
 
@@ -179,7 +245,7 @@ export default function HomeScreen() {
                   Fill
                 </Text>
                 <Text className="mt-1 text-center text-[11px] text-slate-400">
-                  Bin level
+                  {loadPresent ? "Load detected" : "No load"}
                 </Text>
               </View>
 
@@ -191,28 +257,64 @@ export default function HomeScreen() {
                   Mode
                 </Text>
                 <Text className="mt-1 text-center text-[11px] text-slate-400">
-                  Operation
+                  {screenStatus}
                 </Text>
               </View>
             </View>
 
-            <View className="flex-row items-center justify-between">
+            <View className="mt-4 rounded-2xl bg-slate-50 px-4 py-4">
+              <View className="flex-row items-center justify-between">
+                <Text className="text-[12px] font-bold uppercase tracking-wider text-slate-400">
+                  Live Status
+                </Text>
+                <Text className="text-sm font-extrabold text-slate-900">
+                  {screenStatus}
+                </Text>
+              </View>
 
+              <View className="mt-3 flex-row flex-wrap">
+                <View className="mb-3 w-1/2 pr-2">
+                  <Text className="text-xs font-semibold text-slate-400">Conveyor</Text>
+                  <Text className="mt-1 text-sm font-bold text-slate-900">
+                    {conveyorOn ? "ON" : "OFF"}
+                  </Text>
+                </View>
 
+                <View className="mb-3 w-1/2 pl-2">
+                  <Text className="text-xs font-semibold text-slate-400">Distance</Text>
+                  <Text className="mt-1 text-sm font-bold text-slate-900">
+                    {distanceCm} cm
+                  </Text>
+                </View>
+
+                <View className="w-1/2 pr-2">
+                  <Text className="text-xs font-semibold text-slate-400">RTC</Text>
+                  <Text className="mt-1 text-sm font-bold text-slate-900">
+                    {rtcTime}
+                  </Text>
+                </View>
+
+                <View className="w-1/2 pl-2">
+                  <Text className="text-xs font-semibold text-slate-400">Updated</Text>
+                  <Text className="mt-1 text-sm font-bold text-slate-900">
+                    {updatedAtMs || "--"}
+                  </Text>
+                </View>
+              </View>
             </View>
 
             {binFullAlert ? (
               <View className="mt-4 flex-row items-center rounded-2xl bg-red-50 px-3 py-3">
                 <Ionicons name="alert-circle" size={18} color="#ef4444" />
                 <Text className="ml-2 flex-1 text-[13px] font-bold text-red-600">
-                  Bin is nearing full capacity. Please empty it soon.
+                  Load detected from sensor. Check the bin state.
                 </Text>
               </View>
             ) : null}
-          </View>
+          </View> */}
 
-          <View className="mt-6">
-            <Text className="mb-4 text-[12px] font-extrabold uppercase tracking-wider text-slate-400">
+          <View className="mt-12">
+            <Text className="mb-4 text-[15px] font-extrabold uppercase tracking-wider text-slate-400">
               Quick Access
             </Text>
 
@@ -379,7 +481,6 @@ export default function HomeScreen() {
             </View>
           </View>
 
-
           <View className="mt-6">
             <Text className="mb-4 text-[12px] font-extrabold uppercase tracking-wider text-slate-400">
               Latest Event
@@ -447,13 +548,14 @@ export default function HomeScreen() {
             {[
               { label: "Connection", value: connectionLabel, color: connectionColor },
               { label: "Device", value: deviceName },
-              { label: "Status", value: status },
+              { label: "Status", value: screenStatus },
               { label: "Mode", value: mode },
-              { label: "Weight", value: `${weight.toFixed(1)} kg` },
-              { label: "Bin Level", value: `${weightPct}%` },
+              { label: "Weight Raw", value: `${rawWeight}` },
+              { label: "Load Present", value: loadPresent ? "YES" : "NO" },
               { label: "Direction", value: motorDir },
               { label: "Speed", value: `${motorSpeed}` },
               { label: "Device Clock", value: rtcTime },
+              { label: "Distance", value: `${distanceCm} cm` },
             ].map(({ label, value, color }) => (
               <View
                 key={label}

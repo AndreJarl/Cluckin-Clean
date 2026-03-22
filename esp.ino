@@ -1,906 +1,995 @@
-#include <Arduino.h>
-#include <Preferences.h>
-#include <ArduinoJson.h>
-#include <HX711.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <NewPing.h>
+#include <Ds1302.h>
 #include <ESP32Servo.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include "HX711.h"
 
-#include <ThreeWire.h>
-#include <RtcDS1302.h>
+// ================= WIFI =================
+const char* WIFI_SSID = "404 Network Unavailable";
+const char* WIFI_PASS = "dikouy2004!";
 
-// =========================
-// PIN MAP
-// =========================
-static const int PIN_SERVO      = 13;
-static const int PIN_TRIG       = 18;
-static const int PIN_ECHO       = 19;
+// ================= FIREBASE =================
+const char* FIREBASE_HOST = "https://loctrack-552df-default-rtdb.asia-southeast1.firebasedatabase.app";
+const char* FIREBASE_AUTH = "";
 
-static const int PIN_RTC_CLK    = 27;
-static const int PIN_RTC_DAT    = 26;
-static const int PIN_RTC_RST    = 25;
+// ================= DEVICE =================
+const char* DEVICE_ID = "conveyorCleaner01";
 
-static const int PIN_MOTOR_ENA  = 14;
-static const int PIN_MOTOR_IN1  = 16;
-static const int PIN_MOTOR_IN2  = 17;
+// ================= PINS =================
+const int SERVO_PIN = 13;
 
-static const int PIN_HX_DOUT    = 4;
-static const int PIN_HX_SCK     = 5;
+const int RPWM = 14;
+const int LPWM = 16;
+const int REN  = 17;
+const int LEN  = 22;
 
-// =========================
-// MOTOR SETTINGS
-// =========================
-static const int MOTOR_PWM_FREQ = 1000;
-static const int MOTOR_PWM_RES  = 8;
-static const int DEFAULT_MOTOR_SPEED = 120;
+const int TRIG_PIN = 18;
+const int ECHO_PIN = 19;
+const int MAX_DISTANCE = 400;
 
-// =========================
-// SERVO SETTINGS
-// =========================
-static const int SERVO_CLOSED_ANGLE = 0;
-static const int SERVO_OPEN_ANGLE   = 90;
+const int RTC_RST = 25;
+const int RTC_DAT = 26;
+const int RTC_CLK = 27;
 
-// =========================
-// ULTRASONIC SETTINGS
-// =========================
-static const float LID_OPEN_DISTANCE_CM = 15.0f;
-static const unsigned long LID_HOLD_MS = 3000;
+const int HX_DOUT = 4;
+const int HX_SCK  = 5;
 
-// =========================
-// LOAD CELL SETTINGS
-// =========================
-static const float DEFAULT_BIN_FULL_G = 20.0f;
-static const float DEFAULT_BIN_CLEAR_G = 18.0f;
-static const float DEFAULT_CAL_FACTOR = 100.0f;
-
-// =========================
-// STORAGE LIMITS
-// =========================
-static const int MAX_SCHEDULES = 8;
-static const int MAX_HISTORY   = 30;
-
-// =========================
-// BLE UUIDs
-// =========================
-#define SERVICE_UUID        "5c14a7e0-5344-4c7c-b11a-b7c9a4d00001"
-#define RX_CHAR_UUID        "5c14a7e0-5344-4c7c-b11a-b7c9a4d00002"
-#define TX_CHAR_UUID        "5c14a7e0-5344-4c7c-b11a-b7c9a4d00003"
-
-// =========================
-// RTC
-// =========================
-ThreeWire myWire(PIN_RTC_DAT, PIN_RTC_CLK, PIN_RTC_RST);
-RtcDS1302<ThreeWire> rtc(myWire);
-
-// =========================
-// GLOBAL OBJECTS
-// =========================
-Preferences prefs;
+// ================= OBJECTS =================
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE);
+Ds1302 rtc(RTC_RST, RTC_CLK, RTC_DAT);
 HX711 scale;
-Servo lidServo;
+Servo binServo;
 
-BLEServer* bleServer = nullptr;
-BLECharacteristic* txChar = nullptr;
-BLECharacteristic* rxChar = nullptr;
-bool bleClientConnected = false;
+// ================= CALIBRATION =================
+float calibrationFactor = 150.23;
 
-// =========================
-// DATA STRUCTURES
-// =========================
-struct AppConfig {
-  bool autoMode;
-  bool conveyorEnabled;
-  int motorSpeed;
-  float binFullThresholdG;
-  float binClearThresholdG;
-  float calibrationFactor;
-  long tareOffset;
-  bool lidEnabled;
-};
+// ================= LOAD THRESHOLDS =================
+// raw-based presence detection
+const long LOAD_ON_THRESHOLD  = 10000;
+const long LOAD_OFF_THRESHOLD = 5000;
 
-struct ScheduleItem {
+// ================= BIN FULL THRESHOLD =================
+// user-adjustable, grams
+const float DEFAULT_BIN_FULL_THRESHOLD_G = 500.0;
+const float MIN_BIN_FULL_THRESHOLD_G = 500.0;
+const float MAX_BIN_FULL_THRESHOLD_G = 10000.0;
+const float BIN_FULL_HYSTERESIS_G = 50.0;
+
+float binFullThresholdGrams = DEFAULT_BIN_FULL_THRESHOLD_G;
+
+// ================= WEIGHT DISPLAY STABILITY =================
+const float ZERO_DEADBAND_G = 10.0;
+
+// ================= SERVO ANGLES =================
+const int SERVO_CLOSED_ANGLE = 90;
+const int SERVO_OPEN_ANGLE   = 180;
+
+// ================= DEFAULTS =================
+const int DEFAULT_MANUAL_PWM = 180;
+const int DEFAULT_RUN_MS     = 10000;
+
+// ================= STATE =================
+bool conveyorIsOn = false;
+bool loadPresent = false;
+bool binFull = false;
+bool servoOpened = false;
+
+bool manualRun = false;
+int manualPwm = DEFAULT_MANUAL_PWM;
+
+unsigned long lastFirebaseSend = 0;
+unsigned long lastWifiCheck = 0;
+unsigned long lastControlPoll = 0;
+unsigned long lastSchedulePoll = 0;
+unsigned long conveyorLastChanged = 0;
+
+// ================= AUTO RUN STATE =================
+bool autoRunActive = false;
+unsigned long autoRunStartedAt = 0;
+unsigned long autoRunDurationMs = DEFAULT_RUN_MS;
+int autoRunPwm = DEFAULT_MANUAL_PWM;
+String activeScheduleId = "";
+
+// ================= SCHEDULE STORAGE =================
+const int MAX_SCHEDULES = 20;
+
+struct ScheduleSlot {
+  String id;
+  String scheduleId;
+  String title;
+  String date;
+  String hour;
+  String minute;
+  String duration;
   bool enabled;
-  uint8_t hour;
-  uint8_t minute;
-  uint16_t durationSec;
-  uint8_t weekdaysMask;
-  uint32_t lastTriggerDateKey;
-  uint16_t lastTriggerMinute;
+  String status;
+  unsigned long createdAt;
 };
 
-struct HistoryItem {
-  uint32_t epochLike;
-  char type[20];
-  char message[80];
-  float value1;
-  float value2;
-};
+ScheduleSlot schedules[MAX_SCHEDULES];
+int scheduleCount = 0;
 
-AppConfig config;
-ScheduleItem schedules[MAX_SCHEDULES];
-HistoryItem historyLog[MAX_HISTORY];
-int historyCount = 0;
+String lastTriggeredScheduleKey = "";
 
-// =========================
-// RUNTIME STATE
-// =========================
-bool motorRunning = false;
-bool motorManualMode = false;
-unsigned long motorRunUntilMs = 0;
+// ---------------- WIFI ----------------
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-bool lidOpen = false;
-unsigned long lidCloseAtMs = 0;
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
 
-float lastDistanceCm = -1.0f;
-long lastRawWeight = 0;
-float lastWeightG = 0.0f;
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
 
-bool binFullState = false;
-
-unsigned long lastSensorReadMs = 0;
-unsigned long lastStatusNotifyMs = 0;
-unsigned long lastScheduleCheckMs = 0;
-unsigned long lastLoadDebugMs = 0;
-
-// =========================
-// HELPERS
-// =========================
-uint32_t makeDateKey(int year, int month, int day) {
-  return (uint32_t)year * 10000UL + (uint32_t)month * 100UL + (uint32_t)day;
-}
-
-uint32_t packTimestamp(const RtcDateTime& now) {
-  return (uint32_t)(now.Year() % 100) * 100000000UL +
-         (uint32_t)now.Month() * 1000000UL +
-         (uint32_t)now.Day() * 10000UL +
-         (uint32_t)now.Hour() * 100UL +
-         (uint32_t)now.Minute();
-}
-
-String rtcToIsoString(const RtcDateTime& now) {
-  char buf[25];
-  snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u:%02u",
-           now.Year(), now.Month(), now.Day(),
-           now.Hour(), now.Minute(), now.Second());
-  return String(buf);
-}
-
-uint8_t getWeekdayIndex(const RtcDateTime& dt) {
-  return dt.DayOfWeek();
-}
-
-// =========================
-// STORAGE
-// =========================
-void saveConfig() {
-  prefs.putBytes("config", &config, sizeof(config));
-}
-
-void loadConfig() {
-  if (prefs.isKey("config")) {
-    prefs.getBytes("config", &config, sizeof(config));
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
   } else {
-    config.autoMode = true;
-    config.conveyorEnabled = true;
-    config.motorSpeed = DEFAULT_MOTOR_SPEED;
-    config.binFullThresholdG = DEFAULT_BIN_FULL_G;
-    config.binClearThresholdG = DEFAULT_BIN_CLEAR_G;
-    config.calibrationFactor = DEFAULT_CAL_FACTOR;
-    config.tareOffset = 0;
-    config.lidEnabled = true;
-    saveConfig();
+    Serial.println("WiFi connection failed");
   }
 }
 
-void saveSchedules() {
-  prefs.putBytes("schedules", schedules, sizeof(schedules));
-}
+// ---------------- MOTOR ----------------
+void motorForward(int pwmValue) {
+  pwmValue = constrain(pwmValue, 0, 255);
 
-void loadSchedules() {
-  if (prefs.isKey("schedules")) {
-    prefs.getBytes("schedules", schedules, sizeof(schedules));
-  } else {
-    memset(schedules, 0, sizeof(schedules));
-    saveSchedules();
+  digitalWrite(REN, HIGH);
+  digitalWrite(LEN, HIGH);
+
+  ledcWrite(LPWM, 0);
+  ledcWrite(RPWM, pwmValue);
+
+  if (!conveyorIsOn) {
+    conveyorIsOn = true;
+    conveyorLastChanged = millis();
   }
-}
-
-void saveHistory() {
-  prefs.putBytes("history", historyLog, sizeof(historyLog));
-  prefs.putInt("historyCount", historyCount);
-}
-
-void loadHistory() {
-  if (prefs.isKey("history")) {
-    prefs.getBytes("history", historyLog, sizeof(historyLog));
-    historyCount = prefs.getInt("historyCount", 0);
-    if (historyCount < 0) historyCount = 0;
-    if (historyCount > MAX_HISTORY) historyCount = MAX_HISTORY;
-  } else {
-    memset(historyLog, 0, sizeof(historyLog));
-    historyCount = 0;
-    saveHistory();
-  }
-}
-
-// =========================
-// HISTORY
-// =========================
-void addHistory(const char* type, const char* message, float value1 = 0, float value2 = 0) {
-  RtcDateTime now = rtc.GetDateTime();
-
-  HistoryItem item;
-  item.epochLike = packTimestamp(now);
-  strncpy(item.type, type, sizeof(item.type) - 1);
-  item.type[sizeof(item.type) - 1] = '\0';
-  strncpy(item.message, message, sizeof(item.message) - 1);
-  item.message[sizeof(item.message) - 1] = '\0';
-  item.value1 = value1;
-  item.value2 = value2;
-
-  if (historyCount < MAX_HISTORY) {
-    historyLog[historyCount++] = item;
-  } else {
-    for (int i = 1; i < MAX_HISTORY; i++) {
-      historyLog[i - 1] = historyLog[i];
-    }
-    historyLog[MAX_HISTORY - 1] = item;
-  }
-
-  saveHistory();
-}
-
-// =========================
-// BLE SEND
-// =========================
-void bleNotifyJson(const JsonDocument& doc) {
-  if (!bleClientConnected || txChar == nullptr) return;
-
-  String out;
-  serializeJson(doc, out);
-  txChar->setValue(out.c_str());
-  txChar->notify();
-
-  Serial.print("BLE TX: ");
-  Serial.println(out);
-}
-
-void sendAck(const char* cmd, bool ok, const char* message) {
-  StaticJsonDocument<256> doc;
-  doc["type"] = "ack";
-  doc["cmd"] = cmd;
-  doc["ok"] = ok;
-  doc["message"] = message;
-  bleNotifyJson(doc);
-}
-
-void sendEvent(const char* eventName, const char* message, float value1 = 0, float value2 = 0) {
-  StaticJsonDocument<256> doc;
-  doc["type"] = "event";
-  doc["event"] = eventName;
-  doc["message"] = message;
-  doc["value1"] = value1;
-  doc["value2"] = value2;
-  bleNotifyJson(doc);
-}
-
-void sendStatus() {
-  StaticJsonDocument<256> doc;
-
-  doc["type"] = "status";
-  doc["motorRunning"] = motorRunning;
-  doc["motorManualMode"] = motorManualMode;
-  doc["motorSpeed"] = config.motorSpeed;
-  doc["distanceCm"] = lastDistanceCm;
-  doc["weight_g"] = lastWeightG;
-  doc["binFull"] = binFullState;
-  doc["lidOpen"] = lidOpen;
-  doc["lidEnabled"] = config.lidEnabled;
-  doc["autoMode"] = config.autoMode;
-  doc["conveyorEnabled"] = config.conveyorEnabled;
-
-  bleNotifyJson(doc);
-}
-
-void sendSchedules() {
-  StaticJsonDocument<1024> doc;
-  doc["type"] = "schedules";
-
-  JsonArray arr = doc.createNestedArray("items");
-  for (int i = 0; i < MAX_SCHEDULES; i++) {
-    JsonObject o = arr.createNestedObject();
-    o["index"] = i;
-    o["enabled"] = schedules[i].enabled;
-    o["hour"] = schedules[i].hour;
-    o["minute"] = schedules[i].minute;
-    o["durationSec"] = schedules[i].durationSec;
-    o["weekdaysMask"] = schedules[i].weekdaysMask;
-  }
-
-  bleNotifyJson(doc);
-}
-
-void sendHistory() {
-  StaticJsonDocument<4096> doc;
-  doc["type"] = "history";
-
-  JsonArray arr = doc.createNestedArray("items");
-  for (int i = 0; i < historyCount; i++) {
-    JsonObject o = arr.createNestedObject();
-    o["index"] = i;
-    o["ts"] = historyLog[i].epochLike;
-    o["type"] = historyLog[i].type;
-    o["message"] = historyLog[i].message;
-    o["value1"] = historyLog[i].value1;
-    o["value2"] = historyLog[i].value2;
-  }
-
-  bleNotifyJson(doc);
-}
-
-// =========================
-// MOTOR CONTROL
-// =========================
-void motorForward(int speedValue) {
-  if (!config.conveyorEnabled) return;
-
-  speedValue = constrain(speedValue, 0, 255);
-  digitalWrite(PIN_MOTOR_IN1, HIGH);
-  digitalWrite(PIN_MOTOR_IN2, LOW);
-  ledcWrite(PIN_MOTOR_ENA, speedValue);
-  motorRunning = true;
 }
 
 void motorStop() {
-  ledcWrite(PIN_MOTOR_ENA, 0);
-  digitalWrite(PIN_MOTOR_IN1, LOW);
-  digitalWrite(PIN_MOTOR_IN2, LOW);
-  motorRunning = false;
-  motorManualMode = false;
-  motorRunUntilMs = 0;
+  ledcWrite(RPWM, 0);
+  ledcWrite(LPWM, 0);
+  digitalWrite(REN, HIGH);
+  digitalWrite(LEN, HIGH);
+
+  if (conveyorIsOn) {
+    conveyorIsOn = false;
+    conveyorLastChanged = millis();
+  }
 }
 
-void startManualMotor() {
-  motorManualMode = true;
-  motorRunUntilMs = 0;
-  motorForward(config.motorSpeed);
-  addHistory("motor", "Manual motor ON", config.motorSpeed, 0);
-  sendEvent("motor_on", "Manual conveyor ON", config.motorSpeed, 0);
+// ---------------- SERVO ----------------
+void openBinServo() {
+  binServo.write(SERVO_OPEN_ANGLE);
+  servoOpened = true;
 }
 
-void stopManualMotor() {
-  motorStop();
-  addHistory("motor", "Manual motor OFF", 0, 0);
-  sendEvent("motor_off", "Manual conveyor OFF", 0, 0);
+void closeBinServo() {
+  binServo.write(SERVO_CLOSED_ANGLE);
+  servoOpened = false;
 }
 
-void runScheduledMotor(uint16_t durationSec) {
-  if (!config.conveyorEnabled) return;
-
-  motorManualMode = false;
-  motorForward(config.motorSpeed);
-  motorRunUntilMs = millis() + (unsigned long)durationSec * 1000UL;
-
-  addHistory("schedule", "Scheduled conveyor run started", durationSec, config.motorSpeed);
-  sendEvent("schedule_run", "Scheduled conveyor run started", durationSec, config.motorSpeed);
+// ---------------- HELPERS ----------------
+String twoDigits(int v) {
+  if (v < 10) return "0" + String(v);
+  return String(v);
 }
 
-// =========================
-// SERVO / LID
-// =========================
-void openLid() {
-  if (!config.lidEnabled) return;
-
-  lidServo.write(SERVO_OPEN_ANGLE);
-  lidOpen = true;
-  lidCloseAtMs = millis() + LID_HOLD_MS;
+float clampBinThreshold(float value) {
+  if (value < MIN_BIN_FULL_THRESHOLD_G) return MIN_BIN_FULL_THRESHOLD_G;
+  if (value > MAX_BIN_FULL_THRESHOLD_G) return MAX_BIN_FULL_THRESHOLD_G;
+  return value;
 }
 
-void closeLid() {
-  lidServo.write(SERVO_CLOSED_ANGLE);
-  lidOpen = false;
+String getRtcString() {
+  Ds1302::DateTime now;
+  rtc.getDateTime(&now);
+
+  String s = "20" + String(now.year) + "-";
+  s += twoDigits(now.month) + "-";
+  s += twoDigits(now.day) + " ";
+  s += twoDigits(now.hour) + ":";
+  s += twoDigits(now.minute) + ":";
+  s += twoDigits(now.second);
+
+  return s;
 }
 
-// =========================
-// SENSORS
-// =========================
-float readDistanceCm() {
-  digitalWrite(PIN_TRIG, LOW);
-  delayMicroseconds(2);
-  digitalWrite(PIN_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(PIN_TRIG, LOW);
-
-  unsigned long duration = pulseIn(PIN_ECHO, HIGH, 30000);
-  if (duration == 0) return -1.0f;
-
-  float distance = duration * 0.0343f / 2.0f;
-  return distance;
+String getRtcDate() {
+  Ds1302::DateTime now;
+  rtc.getDateTime(&now);
+  return "20" + String(now.year) + "-" + twoDigits(now.month) + "-" + twoDigits(now.day);
 }
 
-long readAverageRaw(int samples = 10) {
-  long sum = 0;
-  int valid = 0;
+String getRtcHour() {
+  Ds1302::DateTime now;
+  rtc.getDateTime(&now);
+  return twoDigits(now.hour);
+}
 
-  for (int i = 0; i < samples; i++) {
-    if (scale.is_ready()) {
-      sum += scale.read();
-      valid++;
+String getRtcMinute() {
+  Ds1302::DateTime now;
+  rtc.getDateTime(&now);
+  return twoDigits(now.minute);
+}
+
+void updateLoadHysteresis(long rawValue) {
+  long mag = abs(rawValue);
+
+  if (!loadPresent && mag >= LOAD_ON_THRESHOLD) {
+    loadPresent = true;
+  } else if (loadPresent && mag <= LOAD_OFF_THRESHOLD) {
+    loadPresent = false;
+  }
+}
+
+float rawToGrams(long rawValue) {
+  return rawValue / calibrationFactor;
+}
+
+float rawToKg(long rawValue) {
+  return rawToGrams(rawValue) / 1000.0;
+}
+
+void updateBinFullState(float weightGrams) {
+  if (!binFull && weightGrams >= binFullThresholdGrams) {
+    binFull = true;
+  } else if (binFull && weightGrams <= (binFullThresholdGrams - BIN_FULL_HYSTERESIS_G)) {
+    binFull = false;
+  }
+}
+
+// ---------------- JSON PARSERS ----------------
+bool parseJsonBool(String json, const char* key, bool fallbackValue) {
+  String pattern = String("\"") + key + "\":";
+  int start = json.indexOf(pattern);
+  if (start < 0) return fallbackValue;
+
+  start += pattern.length();
+  while (start < (int)json.length() &&
+         (json[start] == ' ' || json[start] == '\n' || json[start] == '\r')) {
+    start++;
+  }
+
+  if (json.startsWith("true", start)) return true;
+  if (json.startsWith("false", start)) return false;
+
+  return fallbackValue;
+}
+
+int parseJsonInt(String json, const char* key, int fallbackValue) {
+  String pattern = String("\"") + key + "\":";
+  int start = json.indexOf(pattern);
+  if (start < 0) return fallbackValue;
+
+  start += pattern.length();
+  while (start < (int)json.length() &&
+         (json[start] == ' ' || json[start] == '\n' || json[start] == '\r' || json[start] == '"')) {
+    start++;
+  }
+
+  int end = start;
+  while (end < (int)json.length() && (isDigit(json[end]) || json[end] == '-')) {
+    end++;
+  }
+
+  String numberStr = json.substring(start, end);
+  if (numberStr.length() == 0) return fallbackValue;
+
+  return numberStr.toInt();
+}
+
+float parseJsonFloat(String json, const char* key, float fallbackValue) {
+  String pattern = String("\"") + key + "\":";
+  int start = json.indexOf(pattern);
+  if (start < 0) return fallbackValue;
+
+  start += pattern.length();
+  while (start < (int)json.length() &&
+         (json[start] == ' ' || json[start] == '\n' || json[start] == '\r' || json[start] == '"')) {
+    start++;
+  }
+
+  int end = start;
+  while (end < (int)json.length() &&
+         (isDigit(json[end]) || json[end] == '-' || json[end] == '.')) {
+    end++;
+  }
+
+  String numberStr = json.substring(start, end);
+  if (numberStr.length() == 0) return fallbackValue;
+
+  return numberStr.toFloat();
+}
+
+String parseJsonString(String json, const char* key, String fallbackValue) {
+  String pattern = String("\"") + key + "\":\"";
+  int start = json.indexOf(pattern);
+  if (start < 0) return fallbackValue;
+
+  start += pattern.length();
+  int end = json.indexOf("\"", start);
+  if (end < 0) return fallbackValue;
+
+  return json.substring(start, end);
+}
+
+// ---------------- RTC SYNC ----------------
+bool applyRtcSyncFromJson(const String& body) {
+  if (body.length() == 0 || body == "null") return false;
+
+  bool syncRtc = parseJsonBool(body, "syncRtc", false);
+  if (!syncRtc) return false;
+
+  int year   = parseJsonInt(body, "year", 26);
+  int month  = parseJsonInt(body, "month", 1);
+  int day    = parseJsonInt(body, "day", 1);
+  int hour   = parseJsonInt(body, "hour", 0);
+  int minute = parseJsonInt(body, "minute", 0);
+  int second = parseJsonInt(body, "second", 0);
+
+  year   = constrain(year, 0, 99);
+  month  = constrain(month, 1, 12);
+  day    = constrain(day, 1, 31);
+  hour   = constrain(hour, 0, 23);
+  minute = constrain(minute, 0, 59);
+  second = constrain(second, 0, 59);
+
+  Ds1302::DateTime dt;
+  dt.year = year;
+  dt.month = month;
+  dt.day = day;
+  dt.hour = hour;
+  dt.minute = minute;
+  dt.second = second;
+  dt.dow = 1;
+
+  rtc.setDateTime(&dt);
+
+  Serial.println("RTC synced from Firebase");
+  Serial.print("New RTC: ");
+  Serial.println(getRtcString());
+
+  return true;
+}
+
+// ---------------- FIREBASE HTTP ----------------
+String makeFirebaseUrl(String path) {
+  String url = String(FIREBASE_HOST) + path + ".json";
+  if (String(FIREBASE_AUTH).length() > 0) {
+    url += "?auth=" + String(FIREBASE_AUTH);
+  }
+  return url;
+}
+
+bool firebasePatch(String path, String jsonPayload) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Firebase skip: WiFi not connected");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = makeFirebaseUrl(path);
+
+  if (!http.begin(client, url)) {
+    Serial.println("HTTP begin failed");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.sendRequest("PATCH", jsonPayload);
+
+  Serial.print("PATCH ");
+  Serial.print(path);
+  Serial.print(" -> ");
+  Serial.println(httpCode);
+
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println(response);
+  } else {
+    Serial.print("PATCH error: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+  return (httpCode >= 200 && httpCode < 300);
+}
+
+bool firebasePut(String path, String jsonPayload) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = makeFirebaseUrl(path);
+
+  if (!http.begin(client, url)) {
+    Serial.println("HTTP begin failed");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.PUT(jsonPayload);
+
+  Serial.print("PUT ");
+  Serial.print(path);
+  Serial.print(" -> ");
+  Serial.println(httpCode);
+
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println(response);
+  } else {
+    Serial.print("PUT error: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+  return (httpCode >= 200 && httpCode < 300);
+}
+
+bool firebaseDelete(String path) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = makeFirebaseUrl(path);
+
+  if (!http.begin(client, url)) {
+    Serial.println("HTTP begin failed");
+    return false;
+  }
+
+  int httpCode = http.sendRequest("DELETE");
+
+  Serial.print("DELETE ");
+  Serial.print(path);
+  Serial.print(" -> ");
+  Serial.println(httpCode);
+
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println(response);
+  } else {
+    Serial.print("DELETE error: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+  return (httpCode >= 200 && httpCode < 300);
+}
+
+String firebaseGet(String path) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return "";
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = makeFirebaseUrl(path);
+
+  if (!http.begin(client, url)) {
+    Serial.println("HTTP begin failed");
+    return "";
+  }
+
+  int httpCode = http.GET();
+  Serial.print("GET ");
+  Serial.print(path);
+  Serial.print(" -> ");
+  Serial.println(httpCode);
+
+  String body = "";
+  if (httpCode > 0) {
+    body = http.getString();
+  } else {
+    Serial.print("GET error: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+  return body;
+}
+
+// ---------------- CONTROL + SETTINGS POLLING ----------------
+void pollManualControlAndRtcSync() {
+  String body = firebaseGet("/devices/" + String(DEVICE_ID) + "/control");
+
+  if (body.length() != 0 && body != "null") {
+    manualRun = parseJsonBool(body, "manualRun", manualRun);
+    manualPwm = constrain(parseJsonInt(body, "manualPwm", manualPwm), 0, 255);
+
+    bool rtcSynced = applyRtcSyncFromJson(body);
+    if (rtcSynced) {
+      firebasePatch(
+        "/devices/" + String(DEVICE_ID) + "/control/rtcSync",
+        "{\"syncRtc\":false}"
+      );
     }
-    delay(5);
+
+    Serial.println("Control updated:");
+    Serial.print("manualRun = ");
+    Serial.println(manualRun ? "true" : "false");
+    Serial.print("manualPwm = ");
+    Serial.println(manualPwm);
   }
 
-  if (valid == 0) return lastRawWeight;
-  return sum / valid;
-}
+  String settingsBody = firebaseGet("/devices/" + String(DEVICE_ID) + "/settings");
+  if (settingsBody.length() != 0 && settingsBody != "null") {
+    float newThreshold = parseJsonFloat(
+      settingsBody,
+      "binFullThresholdGrams",
+      binFullThresholdGrams
+    );
+    binFullThresholdGrams = clampBinThreshold(newThreshold);
 
-float rawToGrams(long raw) {
-  return ((float)(raw - config.tareOffset)) / config.calibrationFactor;
-}
-
-void printLoadCellDebug() {
-  Serial.print("Raw: ");
-  Serial.print(lastRawWeight);
-  Serial.print("  Tare: ");
-  Serial.print(config.tareOffset);
-  Serial.print("  CalFactor: ");
-  Serial.print(config.calibrationFactor);
-  Serial.print("  Weight_g: ");
-  Serial.println(lastWeightG);
-}
-
-void performTare() {
-  long avg = readAverageRaw(20);
-  config.tareOffset = avg;
-  saveConfig();
-
-  Serial.print("Tare offset set to: ");
-  Serial.println(config.tareOffset);
-
-  addHistory("loadcell", "Tare completed", avg, 0);
-  sendEvent("tare_done", "Load cell tare complete", avg, 0);
-}
-
-// =========================
-// AUTONOMOUS CHECKS
-// =========================
-void checkLidLogic() {
-  lastDistanceCm = readDistanceCm();
-
-  if (config.lidEnabled && lastDistanceCm > 0 && lastDistanceCm <= LID_OPEN_DISTANCE_CM) {
-    if (!lidOpen) {
-      openLid();
-      addHistory("lid", "Lid opened by ultrasonic", lastDistanceCm, 0);
-      sendEvent("lid_open", "Ultrasonic detected object, lid opened", lastDistanceCm, 0);
-    } else {
-      lidCloseAtMs = millis() + LID_HOLD_MS;
-    }
-  }
-
-  if (lidOpen && millis() > lidCloseAtMs) {
-    closeLid();
-    addHistory("lid", "Lid closed", 0, 0);
-    sendEvent("lid_close", "Lid closed", 0, 0);
+    Serial.print("binFullThresholdGrams = ");
+    Serial.println(binFullThresholdGrams, 2);
   }
 }
 
-void checkLoadCellLogic() {
-  lastRawWeight = readAverageRaw(10);
-  lastWeightG = rawToGrams(lastRawWeight);
-
-  if (!binFullState && lastWeightG >= config.binFullThresholdG) {
-    binFullState = true;
-    addHistory("bin", "The waste bin is full please change", lastWeightG, 0);
-    sendEvent("bin_full", "The waste bin is full please change", lastWeightG, 0);
-  } else if (binFullState && lastWeightG <= config.binClearThresholdG) {
-    binFullState = false;
-    addHistory("bin", "Waste bin returned below full threshold", lastWeightG, 0);
-    sendEvent("bin_clear", "Waste bin is no longer full", lastWeightG, 0);
-  }
-
-  if (millis() - lastLoadDebugMs >= 1000) {
-    lastLoadDebugMs = millis();
-    printLoadCellDebug();
-  }
-}
-
-void checkScheduleLogic() {
-  if (!config.autoMode) return;
-  if (!config.conveyorEnabled) return;
-
-  RtcDateTime now = rtc.GetDateTime();
-  uint8_t weekday = getWeekdayIndex(now);
-  uint16_t minuteOfDay = now.Hour() * 60 + now.Minute();
-  uint32_t dateKey = makeDateKey(now.Year(), now.Month(), now.Day());
-
+// ---------------- SCHEDULE PARSING ----------------
+void clearSchedules() {
+  scheduleCount = 0;
   for (int i = 0; i < MAX_SCHEDULES; i++) {
-    if (!schedules[i].enabled) continue;
+    schedules[i].id = "";
+    schedules[i].scheduleId = "";
+    schedules[i].title = "";
+    schedules[i].date = "";
+    schedules[i].hour = "";
+    schedules[i].minute = "";
+    schedules[i].duration = "";
+    schedules[i].enabled = false;
+    schedules[i].status = "";
+    schedules[i].createdAt = 0;
+  }
+}
 
-    bool dayMatch = (schedules[i].weekdaysMask & (1 << weekday)) != 0;
-    if (!dayMatch) continue;
+bool parseNextScheduleObject(const String& json, int& fromIndex, ScheduleSlot& slot) {
+  int keyStart = json.indexOf("\"schedule_", fromIndex);
+  if (keyStart < 0) return false;
 
-    uint16_t schedMinute = schedules[i].hour * 60 + schedules[i].minute;
+  int keyEnd = json.indexOf("\"", keyStart + 1);
+  if (keyEnd < 0) return false;
 
-    if (minuteOfDay == schedMinute) {
-      bool alreadyTriggeredTodayThisMinute =
-        (schedules[i].lastTriggerDateKey == dateKey) &&
-        (schedules[i].lastTriggerMinute == minuteOfDay);
+  String objKey = json.substring(keyStart + 1, keyEnd);
 
-      if (!alreadyTriggeredTodayThisMinute) {
-        runScheduledMotor(schedules[i].durationSec);
-        schedules[i].lastTriggerDateKey = dateKey;
-        schedules[i].lastTriggerMinute = minuteOfDay;
-        saveSchedules();
+  int objStart = json.indexOf("{", keyEnd);
+  if (objStart < 0) return false;
 
-        addHistory("schedule", "Schedule matched and triggered", i, schedules[i].durationSec);
+  int depth = 0;
+  int objEnd = -1;
+  for (int i = objStart; i < (int)json.length(); i++) {
+    if (json[i] == '{') depth++;
+    else if (json[i] == '}') {
+      depth--;
+      if (depth == 0) {
+        objEnd = i;
+        break;
       }
     }
   }
+  if (objEnd < 0) return false;
+
+  String obj = json.substring(objStart, objEnd + 1);
+
+  slot.id = objKey;
+  slot.scheduleId = parseJsonString(obj, "scheduleId", objKey);
+  slot.title = parseJsonString(obj, "title", "Untitled");
+  slot.date = parseJsonString(obj, "date", "");
+  slot.hour = parseJsonString(obj, "hour", "00");
+  slot.minute = parseJsonString(obj, "minute", "00");
+  slot.duration = parseJsonString(obj, "duration", "10");
+  slot.enabled = parseJsonBool(obj, "enabled", false);
+  slot.status = parseJsonString(obj, "status", "PENDING");
+  slot.createdAt = (unsigned long)parseJsonInt(obj, "createdAt", 0);
+
+  fromIndex = objEnd + 1;
+  return true;
 }
 
-void updateMotorRuntime() {
-  if (motorRunning && !motorManualMode && motorRunUntilMs > 0 && millis() >= motorRunUntilMs) {
-    motorStop();
-    addHistory("motor", "Scheduled motor run finished", 0, 0);
-    sendEvent("motor_stop", "Scheduled conveyor run finished", 0, 0);
-  }
-}
+void pollSchedules() {
+  String body = firebaseGet("/devices/" + String(DEVICE_ID) + "/schedule/slots");
+  clearSchedules();
 
-// =========================
-// BLE CALLBACKS
-// =========================
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) override {
-    bleClientConnected = true;
-    addHistory("ble", "BLE client connected", 0, 0);
-  }
-
-  void onDisconnect(BLEServer* pServer) override {
-    bleClientConnected = false;
-    addHistory("ble", "BLE client disconnected", 0, 0);
-    BLEDevice::startAdvertising();
-  }
-};
-
-void handleSetSchedule(JsonDocument& doc) {
-  if (!doc.containsKey("index")) {
-    sendAck("setSchedule", false, "Missing index");
+  if (body.length() == 0 || body == "null") {
+    Serial.println("No schedules found");
     return;
   }
 
-  int idx = doc["index"];
-  if (idx < 0 || idx >= MAX_SCHEDULES) {
-    sendAck("setSchedule", false, "Invalid index");
-    return;
-  }
+  int idx = 0;
+  while (scheduleCount < MAX_SCHEDULES) {
+    ScheduleSlot slot;
+    if (!parseNextScheduleObject(body, idx, slot)) break;
 
-  schedules[idx].enabled = doc["enabled"] | true;
-  schedules[idx].hour = doc["hour"] | 0;
-  schedules[idx].minute = doc["minute"] | 0;
-  schedules[idx].durationSec = doc["durationSec"] | 2;
-  schedules[idx].weekdaysMask = doc["weekdaysMask"] | 127;
-
-  saveSchedules();
-  addHistory("schedule", "Schedule updated", idx, schedules[idx].durationSec);
-  sendAck("setSchedule", true, "Schedule updated");
-  sendSchedules();
-}
-
-void handleRemoveSchedule(JsonDocument& doc) {
-  if (!doc.containsKey("index")) {
-    sendAck("removeSchedule", false, "Missing index");
-    return;
-  }
-
-  int idx = doc["index"];
-  if (idx < 0 || idx >= MAX_SCHEDULES) {
-    sendAck("removeSchedule", false, "Invalid index");
-    return;
-  }
-
-  memset(&schedules[idx], 0, sizeof(ScheduleItem));
-  saveSchedules();
-
-  addHistory("schedule", "Schedule removed", idx, 0);
-  sendAck("removeSchedule", true, "Schedule removed");
-  sendSchedules();
-}
-
-void handleBleCommand(const String& json) {
-  Serial.print("BLE RX: ");
-  Serial.println(json);
-
-  StaticJsonDocument<1024> doc;
-  DeserializationError err = deserializeJson(doc, json);
-
-  if (err) {
-    sendAck("parse", false, "Invalid JSON");
-    return;
-  }
-
-  const char* cmd = doc["cmd"] | "";
-  if (strlen(cmd) == 0) {
-    sendAck("unknown", false, "Missing cmd");
-    return;
-  }
-
-  if (strcmp(cmd, "getStatus") == 0) {
-    sendStatus();
-    return;
-  }
-
-  if (strcmp(cmd, "getSchedules") == 0) {
-    sendSchedules();
-    return;
-  }
-
-  if (strcmp(cmd, "getHistory") == 0) {
-    sendHistory();
-    return;
-  }
-
-  if (strcmp(cmd, "motorOn") == 0) {
-    startManualMotor();
-    sendAck(cmd, true, "Motor turned ON");
-    return;
-  }
-
-  if (strcmp(cmd, "motorOff") == 0) {
-    stopManualMotor();
-    sendAck(cmd, true, "Motor turned OFF");
-    return;
-  }
-
-  if (strcmp(cmd, "runMotorFor") == 0) {
-    int sec = doc["durationSec"] | 2;
-    sec = constrain(sec, 1, 60);
-    motorManualMode = false;
-    motorForward(config.motorSpeed);
-    motorRunUntilMs = millis() + (unsigned long)sec * 1000UL;
-    addHistory("motor", "Motor run for duration", sec, config.motorSpeed);
-    sendAck(cmd, true, "Motor started for duration");
-    return;
-  }
-
-  if (strcmp(cmd, "setMotorSpeed") == 0) {
-    int speed = doc["speed"] | DEFAULT_MOTOR_SPEED;
-    config.motorSpeed = constrain(speed, 0, 255);
-    saveConfig();
-
-    if (motorRunning) {
-      motorForward(config.motorSpeed);
-    }
-
-    addHistory("config", "Motor speed updated", config.motorSpeed, 0);
-    sendAck(cmd, true, "Motor speed updated");
-    return;
-  }
-
-  if (strcmp(cmd, "setAutoMode") == 0) {
-    config.autoMode = doc["enabled"] | true;
-    saveConfig();
-    addHistory("config", "Auto mode changed", config.autoMode, 0);
-    sendAck(cmd, true, "Auto mode updated");
-    return;
-  }
-
-  if (strcmp(cmd, "setConveyorEnabled") == 0) {
-    config.conveyorEnabled = doc["enabled"] | true;
-    saveConfig();
-
-    if (!config.conveyorEnabled && motorRunning) {
-      motorStop();
-    }
-
-    addHistory("config", "Conveyor enabled changed", config.conveyorEnabled, 0);
-    sendAck(cmd, true, "Conveyor enabled updated");
-    return;
-  }
-
-  if (strcmp(cmd, "setLidEnabled") == 0) {
-    config.lidEnabled = doc["enabled"] | true;
-    saveConfig();
-    addHistory("config", "Lid enabled changed", config.lidEnabled, 0);
-    sendAck(cmd, true, "Lid enabled updated");
-    return;
-  }
-
-  if (strcmp(cmd, "setSchedule") == 0) {
-    handleSetSchedule(doc);
-    return;
-  }
-
-  if (strcmp(cmd, "removeSchedule") == 0) {
-    handleRemoveSchedule(doc);
-    return;
-  }
-
-  if (strcmp(cmd, "tareLoadCell") == 0) {
-    performTare();
-    sendAck(cmd, true, "Tare complete");
-    return;
-  }
-
-  if (strcmp(cmd, "setCalibrationFactor") == 0) {
-    float factor = doc["factor"] | DEFAULT_CAL_FACTOR;
-    if (factor == 0.0f) {
-      sendAck(cmd, false, "Factor cannot be zero");
-      return;
-    }
-    config.calibrationFactor = factor;
-    saveConfig();
-
-    Serial.print("Calibration factor updated to: ");
-    Serial.println(config.calibrationFactor);
-
-    addHistory("config", "Calibration factor updated", factor, 0);
-    sendAck(cmd, true, "Calibration factor updated");
-    return;
-  }
-
-  if (strcmp(cmd, "setBinThreshold") == 0) {
-    config.binFullThresholdG = doc["full_g"] | DEFAULT_BIN_FULL_G;
-    config.binClearThresholdG = doc["clear_g"] | DEFAULT_BIN_CLEAR_G;
-    saveConfig();
-
-    addHistory("config", "Bin thresholds updated", config.binFullThresholdG, config.binClearThresholdG);
-    sendAck(cmd, true, "Bin thresholds updated");
-    return;
-  }
-
-  if (strcmp(cmd, "setRtc") == 0) {
-    int year   = doc["year"]   | 2026;
-    int month  = doc["month"]  | 1;
-    int day    = doc["day"]    | 1;
-    int hour   = doc["hour"]   | 0;
-    int minute = doc["minute"] | 0;
-    int second = doc["second"] | 0;
-
-    RtcDateTime dt(year, month, day, hour, minute, second);
-    rtc.SetDateTime(dt);
-
-    Serial.print("RTC updated to: ");
-    Serial.println(rtcToIsoString(dt));
-
-    addHistory("rtc", "RTC updated from app", year, month);
-    sendAck(cmd, true, "RTC updated");
-    return;
-  }
-
-  if (strcmp(cmd, "clearHistory") == 0) {
-    memset(historyLog, 0, sizeof(historyLog));
-    historyCount = 0;
-    saveHistory();
-    sendAck(cmd, true, "History cleared");
-    return;
-  }
-
-  sendAck(cmd, false, "Unknown command");
-}
-
-class RxCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* characteristic) override {
-    String incoming = characteristic->getValue();
-    if (incoming.length() > 0) {
-      handleBleCommand(incoming);
+    if (slot.id.length() > 0) {
+      schedules[scheduleCount++] = slot;
     }
   }
-};
 
-// =========================
-// BLE SETUP
-// =========================
-// =========================
-// BLE SETUP
-// =========================
-void setupBle() {
-  BLEDevice::init("ESP32_ConveyorCleaner");
-  
-  // CRITICAL: This allows the ESP32 to receive large JSON strings.
-  // Without this, writing long commands will fail.
-  BLEDevice::setMTU(512); 
-
-  bleServer = BLEDevice::createServer();
-  bleServer->setCallbacks(new MyServerCallbacks());
-
-  BLEService* service = bleServer->createService(SERVICE_UUID);
-
-  txChar = service->createCharacteristic(
-    TX_CHAR_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY |
-    BLECharacteristic::PROPERTY_READ
-  );
-  txChar->addDescriptor(new BLE2902());
-
-  rxChar = service->createCharacteristic(
-    RX_CHAR_UUID,
-    BLECharacteristic::PROPERTY_WRITE |
-    BLECharacteristic::PROPERTY_WRITE_NR
-  );
-  
-  // Attach the RX callbacks to handle incoming commands
-  rxChar->setCallbacks(new RxCallbacks());
-
-  service->start();
-
-  BLEAdvertising* advertising = BLEDevice::getAdvertising();
-  advertising->addServiceUUID(SERVICE_UUID);
-  advertising->start();
-
-  Serial.println("BLE advertising started");
-  Serial.println("BLE service and characteristics created");
-  Serial.print("SERVICE_UUID: ");
-  Serial.println(SERVICE_UUID);
-  Serial.print("RX_CHAR_UUID: ");
-  Serial.println(RX_CHAR_UUID);
-  Serial.print("TX_CHAR_UUID: ");
-  Serial.println(TX_CHAR_UUID);
+  Serial.print("Loaded schedules: ");
+  Serial.println(scheduleCount);
 }
 
-// =========================
-// SETUP
-// =========================
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-
-  prefs.begin("cleaner", false);
-  loadConfig();
-  loadSchedules();
-  loadHistory();
-
-  pinMode(PIN_MOTOR_IN1, OUTPUT);
-  pinMode(PIN_MOTOR_IN2, OUTPUT);
-  ledcAttach(PIN_MOTOR_ENA, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
-  motorStop();
-
-  pinMode(PIN_TRIG, OUTPUT);
-  pinMode(PIN_ECHO, INPUT);
-
-  lidServo.attach(PIN_SERVO);
-  closeLid();
-
-  rtc.Begin();
-  if (!rtc.IsDateTimeValid()) {
-    Serial.println("RTC time invalid. Please set RTC from app.");
-  } else {
-    RtcDateTime now = rtc.GetDateTime();
-    Serial.print("RTC time: ");
-    Serial.println(rtcToIsoString(now));
-  }
-
-  scale.begin(PIN_HX_DOUT, PIN_HX_SCK);
-  delay(500);
-
-  setupBle();
-
-  addHistory("system", "System boot", 0, 0);
-  Serial.println("System ready");
+// ---------------- HISTORY WRITES ----------------
+String sanitizeKey(String s) {
+  s.replace(" ", "_");
+  s.replace(":", "-");
+  s.replace("/", "-");
+  s.replace(".", "-");
+  return s;
 }
 
-// =========================
-// LOOP
-// =========================
-void loop() {
+void writeHistoryItem(
+  const String& scheduleId,
+  const String& title,
+  const String& date,
+  const String& hour,
+  const String& minute,
+  const String& duration,
+  const String& status
+) {
+  String historyId = "history_" + sanitizeKey(date) + "_" + hour + minute + "_" + String(millis());
+
+  String payload = "{";
+  payload += "\"scheduleId\":\"" + scheduleId + "\",";
+  payload += "\"title\":\"" + title + "\",";
+  payload += "\"date\":\"" + date + "\",";
+  payload += "\"hour\":\"" + hour + "\",";
+  payload += "\"minute\":\"" + minute + "\",";
+  payload += "\"duration\":\"" + duration + "\",";
+  payload += "\"mode\":\"AUTO\",";
+  payload += "\"status\":\"" + status + "\",";
+  payload += "\"executedAt\":" + String(millis());
+  payload += "}";
+
+  firebasePut("/devices/" + String(DEVICE_ID) + "/history/" + historyId, payload);
+}
+
+void updateScheduleStatus(const String& scheduleId, const String& status) {
+  String path = "/devices/" + String(DEVICE_ID) + "/schedule/slots/" + scheduleId;
+  String payload = "{\"status\":\"" + status + "\"}";
+  firebasePatch(path, payload);
+}
+
+void deleteExecutedSchedule(const String& scheduleId) {
+  firebaseDelete("/devices/" + String(DEVICE_ID) + "/schedule/slots/" + scheduleId);
+}
+
+// ---------------- STATUS JSON ----------------
+String makeStatusJson(long rawValue, float weightGrams, float weightKg, unsigned int distanceCm, String rtcText) {
   unsigned long nowMs = millis();
 
-  if (nowMs - lastSensorReadMs >= 300) {
-    lastSensorReadMs = nowMs;
-    checkLidLogic();
-    checkLoadCellLogic();
+  String json = "{";
+  json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"conveyor\":{";
+  json += "\"isOn\":" + String(conveyorIsOn ? "true" : "false") + ",";
+  json += "\"lastChanged\":" + String(conveyorLastChanged);
+  json += "},";
+  json += "\"control\":{";
+  json += "\"manualRun\":" + String(manualRun ? "true" : "false") + ",";
+  json += "\"manualPwm\":" + String(manualPwm);
+  json += "},";
+  json += "\"settings\":{";
+  json += "\"binFullThresholdGrams\":" + String(binFullThresholdGrams, 2);
+  json += "},";
+  json += "\"auto\":{";
+  json += "\"running\":" + String(autoRunActive ? "true" : "false") + ",";
+  json += "\"activeScheduleId\":\"" + activeScheduleId + "\",";
+  json += "\"pwm\":" + String(autoRunPwm);
+  json += "},";
+  json += "\"loadCell\":{";
+  json += "\"raw\":" + String(rawValue) + ",";
+  json += "\"weightGrams\":" + String(weightGrams, 2) + ",";
+  json += "\"weightKg\":" + String(weightKg, 3) + ",";
+  json += "\"loadPresent\":" + String(loadPresent ? "true" : "false") + ",";
+  json += "\"binFull\":" + String(binFull ? "true" : "false");
+  json += "},";
+  json += "\"servo\":{";
+  json += "\"opened\":" + String(servoOpened ? "true" : "false");
+  json += "},";
+  json += "\"ultrasonic\":{";
+  json += "\"distanceCm\":" + String(distanceCm);
+  json += "},";
+  json += "\"rtc\":{";
+  json += "\"dateTime\":\"" + rtcText + "\"";
+  json += "},";
+  json += "\"updatedAtMs\":" + String(nowMs);
+  json += "}";
+
+  return json;
+}
+
+// ---------------- AUTO SCHEDULE LOGIC ----------------
+unsigned long scheduleDurationToMs(const String& durationStr) {
+  int durationValue = durationStr.toInt();
+  if (durationValue <= 0) durationValue = 10;
+  return (unsigned long)durationValue * 60UL * 1000UL;
+}
+
+void startAutoRun(const ScheduleSlot& slot) {
+  autoRunActive = true;
+  autoRunStartedAt = millis();
+  autoRunDurationMs = scheduleDurationToMs(slot.duration);
+
+  autoRunPwm = constrain(manualPwm, 0, 255);
+
+  activeScheduleId = slot.id;
+
+  updateScheduleStatus(slot.id, "RUNNING");
+
+  writeHistoryItem(
+    slot.scheduleId.length() > 0 ? slot.scheduleId : slot.id,
+    slot.title,
+    slot.date,
+    slot.hour,
+    slot.minute,
+    slot.duration,
+    "EXECUTED"
+  );
+
+  Serial.println("AUTO RUN STARTED");
+  Serial.print("Schedule: ");
+  Serial.println(slot.title);
+  Serial.print("AUTO PWM = ");
+  Serial.println(autoRunPwm);
+}
+
+void stopAutoRunCompleted() {
+  autoRunActive = false;
+
+  String finishedScheduleId = activeScheduleId;
+  deleteExecutedSchedule(finishedScheduleId);
+
+  activeScheduleId = "";
+  Serial.println("AUTO RUN COMPLETED");
+}
+
+void handleScheduleTriggering() {
+  if (manualRun) return;
+  if (autoRunActive) return;
+
+  String rtcDate = getRtcDate();
+  String rtcHour = getRtcHour();
+  String rtcMinute = getRtcMinute();
+
+  for (int i = 0; i < scheduleCount; i++) {
+    ScheduleSlot& slot = schedules[i];
+    if (!slot.enabled) continue;
+    if (slot.date != rtcDate) continue;
+    if (slot.hour != rtcHour) continue;
+    if (slot.minute != rtcMinute) continue;
+
+    String triggerKey = slot.id + "_" + rtcDate + "_" + rtcHour + "_" + rtcMinute;
+    if (triggerKey == lastTriggeredScheduleKey) {
+      continue;
+    }
+
+    lastTriggeredScheduleKey = triggerKey;
+    startAutoRun(slot);
+    break;
+  }
+}
+
+void handleMotorLogic() {
+  if (manualRun) {
+    autoRunActive = false;
+    activeScheduleId = "";
+    motorForward(manualPwm);
+    return;
   }
 
-  if (nowMs - lastScheduleCheckMs >= 1000) {
-    lastScheduleCheckMs = nowMs;
-    checkScheduleLogic();
+  if (autoRunActive) {
+    unsigned long elapsed = millis() - autoRunStartedAt;
+    if (elapsed < autoRunDurationMs) {
+      motorForward(autoRunPwm);
+    } else {
+      motorStop();
+      stopAutoRunCompleted();
+    }
+    return;
   }
 
-  updateMotorRuntime();
+  motorStop();
+}
 
-  if (bleClientConnected && nowMs - lastStatusNotifyMs >= 1000) {
-    lastStatusNotifyMs = nowMs;
-    sendStatus();
+// ---------------- SERVO LOGIC ----------------
+void handleServoLogic() {
+  if (conveyorIsOn) {
+    if (!servoOpened) {
+      Serial.println("CONVEYOR ON -> SERVO OPEN");
+      openBinServo();
+    }
+  } else {
+    if (servoOpened) {
+      Serial.println("CONVEYOR OFF -> SERVO CLOSED");
+      closeBinServo();
+    }
   }
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(REN, OUTPUT);
+  pinMode(LEN, OUTPUT);
+  digitalWrite(REN, HIGH);
+  digitalWrite(LEN, HIGH);
+
+  ledcAttachChannel(RPWM, 1000, 8, 0);
+  ledcAttachChannel(LPWM, 1000, 8, 1);
+
+  conveyorIsOn = false;
+  conveyorLastChanged = millis();
+  motorStop();
+
+  ESP32PWM::allocateTimer(2);
+  binServo.setPeriodHertz(50);
+  binServo.attach(SERVO_PIN, 544, 2400);
+  closeBinServo();
+
+  rtc.init();
+  scale.begin(HX_DOUT, HX_SCK);
+  scale.set_gain(128); // ← add this
+
+
+  delay(2000);
+  if (scale.is_ready()) {
+    Serial.println("Taring HX711...");
+    scale.tare(15);
+    Serial.println("Tare complete");
+
+    long check = scale.get_value(10);
+    Serial.print("Post-tare check: ");
+    Serial.println(check);
+  } else {
+    Serial.println("HX711 not ready during setup");
+  }
+
+  connectWiFi();
+
+  firebasePatch(
+    "/devices/" + String(DEVICE_ID) + "/control",
+    "{\"manualRun\":false,\"manualPwm\":180}"
+  );
+
+  String settingsBody = firebaseGet("/devices/" + String(DEVICE_ID) + "/settings");
+  if (settingsBody == "" || settingsBody == "null") {
+    firebasePatch(
+      "/devices/" + String(DEVICE_ID) + "/settings",
+      "{\"binFullThresholdGrams\":500}"
+    );
+  }
+
+  Serial.println("=== WIFI + FIREBASE + RTC SYNC + MANUAL + AUTO + CALIBRATED LOAD CELL + USER BIN FULL THRESHOLD + SERVO ON CONVEYOR ===");
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  if (millis() - lastWifiCheck > 5000) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected, retrying...");
+      connectWiFi();
+    }
+  }
+
+  if (millis() - lastControlPoll > 2000) {
+    lastControlPoll = millis();
+    pollManualControlAndRtcSync();
+  }
+
+  if (millis() - lastSchedulePoll > 5000) {
+    lastSchedulePoll = millis();
+    pollSchedules();
+  }
+
+  String rtcText = getRtcString();
+  unsigned int distanceCm = sonar.ping_cm();
+
+long raw = 0;
+if (scale.is_ready()) {
+  raw = scale.get_value(5); // ← no minus sign
+} else {
+  Serial.println("HX711 not ready");
+}
+
+  float weightGrams = rawToGrams(raw);
+
+  if (abs(weightGrams) < ZERO_DEADBAND_G) {
+    weightGrams = 0;
+  }
+
+  if (weightGrams < 0) {
+    weightGrams = 0;
+  }
+
+  float weightKg = weightGrams / 1000.0;
+
+  updateLoadHysteresis(raw);
+  updateBinFullState(weightGrams);
+
+  handleScheduleTriggering();
+  handleMotorLogic();
+  handleServoLogic();
+
+  Serial.println("------------------------------");
+  Serial.print("RTC: ");
+  Serial.println(rtcText);
+
+  Serial.print("Ultrasonic (cm): ");
+  Serial.println(distanceCm);
+
+  Serial.print("HX711 raw (tare-adjusted): ");
+  Serial.println(raw);
+
+  Serial.print("Weight (g): ");
+  Serial.println(weightGrams, 2);
+
+  Serial.print("Weight (kg): ");
+  Serial.println(weightKg, 3);
+
+  Serial.print("Bin full threshold (g): ");
+  Serial.println(binFullThresholdGrams, 2);
+
+  Serial.print("Load present: ");
+  Serial.println(loadPresent ? "YES" : "NO");
+
+  Serial.print("Bin full: ");
+  Serial.println(binFull ? "YES" : "NO");
+
+  Serial.print("Servo opened: ");
+  Serial.println(servoOpened ? "YES" : "NO");
+
+  Serial.print("Manual run: ");
+  Serial.println(manualRun ? "YES" : "NO");
+
+  Serial.print("Manual PWM: ");
+  Serial.println(manualPwm);
+
+  Serial.print("Auto active: ");
+  Serial.println(autoRunActive ? "YES" : "NO");
+
+  Serial.print("Auto PWM: ");
+  Serial.println(autoRunPwm);
+
+  Serial.print("Active schedule: ");
+  Serial.println(activeScheduleId);
+
+  Serial.print("Conveyor isOn: ");
+  Serial.println(conveyorIsOn ? "YES" : "NO");
+
+  Serial.print("WiFi: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
+
+  if (millis() - lastFirebaseSend > 3000) {
+    lastFirebaseSend = millis();
+
+    String path = "/devices/" + String(DEVICE_ID) + "/status";
+    String payload = makeStatusJson(raw, weightGrams, weightKg, distanceCm, rtcText);
+
+    Serial.println("Sending status JSON:");
+    Serial.println(payload);
+
+    firebasePatch(path, payload);
+  }
+
+  delay(500);
 }
