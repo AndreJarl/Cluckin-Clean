@@ -1,6 +1,7 @@
 import { Feather, Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
+import { onValue, ref } from "firebase/database";
 import React, { useEffect, useMemo, useState } from "react";
 import {
   ImageBackground,
@@ -13,7 +14,6 @@ import {
   View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import { onValue, ref } from "firebase/database";
 
 import MyAccordion from "@/components/ui/Accordion";
 import { db } from "@/lib/firebase";
@@ -67,19 +67,19 @@ export default function HomeScreen() {
   const shadowStyle =
     Platform.OS === "ios"
       ? {
-          shadowColor: "#0f172a",
-          shadowOffset: { width: 0, height: 10 },
-          shadowOpacity: 0.08,
-          shadowRadius: 18,
-        }
+        shadowColor: "#0f172a",
+        shadowOffset: { width: 0, height: 10 },
+        shadowOpacity: 0.08,
+        shadowRadius: 18,
+      }
       : { elevation: 4 };
 
   const isConnected = !!statusData?.wifiConnected;
   const connectionLabel = loading
     ? "Loading..."
     : isConnected
-    ? "Online"
-    : "Offline";
+      ? "Online"
+      : "Offline";
   const connectionColor = isConnected ? "#10b981" : "#ef4444";
   const connectionBg = isConnected ? "#dcfce7" : "#fee2e2";
 
@@ -481,17 +481,22 @@ export default function HomeScreen() {
             </View>
           </View>
 
-          <View className="mt-6">
-            <Text className="mb-4 text-[12px] font-extrabold uppercase tracking-wider text-slate-400">
-              Latest Event
-            </Text>
+     
 
-            <View className="rounded-3xl bg-white p-5" style={shadowStyle}>
-              <Text className="text-[15px] font-semibold leading-6 text-slate-800">
-                {lastEvent}
-              </Text>
-            </View>
-          </View>
+
+
+
+
+
+
+
+
+
+
+
+
+
+     
 
           <TouchableOpacity
             activeOpacity={0.85}

@@ -1,250 +1,681 @@
-import React, { useMemo } from "react";
+import { Feather, Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert,
+  ActivityIndicator,
   RefreshControl,
+  SafeAreaView,
   ScrollView,
+  StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from "react-native";
-import { Feather } from "@expo/vector-icons";
-import { useBleCommands } from "@/providers/ble/useBleCommands";
-import { useBle } from "@/providers/ble/useBle";
+import { onValue, ref } from "firebase/database";
 
-type NotificationCardProps = {
-  title: string;
-  value: string;
-  subtitle?: string;
-  tone?: "default" | "success" | "warning" | "danger" | "info";
+import { db } from "@/lib/firebase";
+
+const DEVICE_ID = "conveyorCleaner01";
+
+type DeviceStatus = {
+  wifiConnected?: boolean;
+  updatedAtMs?: number;
+  loadCell?: {
+    raw?: number;
+    weightGrams?: number;
+    weightKg?: number;
+    loadPresent?: boolean;
+    binFull?: boolean;
+  };
+  settings?: {
+    binFullThresholdGrams?: number;
+  };
+  rtc?: {
+    dateTime?: string;
+  };
 };
 
-function NotificationCard({
-  title,
-  value,
-  subtitle,
-  tone = "default",
-}: NotificationCardProps) {
-  const toneStyles = {
-    default: {
-      border: "border-gray-100",
-      title: "text-gray-400",
-      value: "text-gray-900",
-      subtitle: "text-gray-500",
-    },
-    success: {
-      border: "border-green-100",
-      title: "text-green-500",
-      value: "text-green-700",
-      subtitle: "text-green-600",
-    },
-    warning: {
-      border: "border-amber-100",
-      title: "text-amber-500",
-      value: "text-amber-700",
-      subtitle: "text-amber-600",
-    },
-    danger: {
-      border: "border-red-100",
-      title: "text-red-500",
-      value: "text-red-700",
-      subtitle: "text-red-600",
-    },
-    info: {
-      border: "border-blue-100",
-      title: "text-blue-500",
-      value: "text-blue-700",
-      subtitle: "text-blue-600",
-    },
-  }[tone];
+type HistoryItem = {
+  id: string;
+  title?: string;
+  status?: "EXECUTED" | "FAILED" | "SKIPPED" | string;
+  date?: string;
+  hour?: string;
+  minute?: string;
+  duration?: string;
+  executedAt?: number;
+  scheduleId?: string;
+};
+
+type AppNotification = {
+  id: string;
+  type: "success" | "error" | "warning" | "info";
+  title: string;
+  message: string;
+  timestamp: number;
+  source: "status" | "history" | "system";
+};
+
+function mapHistory(
+  value: Record<string, Omit<HistoryItem, "id">> | null | undefined
+): HistoryItem[] {
+  if (!value) return [];
+  return Object.entries(value)
+    .map(([id, item]) => ({
+      id,
+      ...(item as Omit<HistoryItem, "id">),
+    }))
+    .sort((a, b) => Number(b.executedAt ?? 0) - Number(a.executedAt ?? 0));
+}
+
+function formatTimeAgo(ts?: number) {
+  if (!ts) return "--";
+  const diff = Date.now() - ts;
+  const sec = Math.floor(diff / 1000);
+  if (sec < 5) return "Just now";
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day}d ago`;
+}
+
+function formatTo12Hour(hour?: string, minute?: string) {
+  if (!hour || !minute) return "--";
+  let h = Number(hour);
+  const m = String(minute).padStart(2, "0");
+  const period = h >= 12 ? "PM" : "AM";
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}:${m} ${period}`;
+}
+
+function buildHistoryMessage(item: HistoryItem) {
+  const title = item.title || "Schedule event";
+  const time = formatTo12Hour(item.hour, item.minute);
+  const duration = item.duration ? `${item.duration} min` : "--";
+  return `${title} • ${time} • ${duration}`;
+}
+
+function notificationMeta(type: AppNotification["type"]) {
+  switch (type) {
+    case "success":
+      return {
+        icon: "check-circle" as const,
+        iconLib: "feather" as const,
+        tint: "#16a34a",
+        bg: "#dcfce7",
+        border: "#bbf7d0",
+      };
+    case "error":
+      return {
+        icon: "close-circle" as const,
+        iconLib: "ionicons" as const,
+        tint: "#dc2626",
+        bg: "#fee2e2",
+        border: "#fecaca",
+      };
+    case "warning":
+      return {
+        icon: "warning" as const,
+        iconLib: "ionicons" as const,
+        tint: "#d97706",
+        bg: "#fef3c7",
+        border: "#fde68a",
+      };
+    default:
+      return {
+        icon: "information-circle" as const,
+        iconLib: "ionicons" as const,
+        tint: "#2563eb",
+        bg: "#dbeafe",
+        border: "#bfdbfe",
+      };
+  }
+}
+
+function NotificationIcon({ type }: { type: AppNotification["type"] }) {
+  const meta = notificationMeta(type);
 
   return (
-    <View className={`bg-white rounded-3xl p-4 mb-4 border ${toneStyles.border} shadow-sm`}>
-      <Text className={`text-xs uppercase tracking-widest mb-1 ${toneStyles.title}`}>
-        {title}
-      </Text>
-      <Text className={`text-lg font-semibold ${toneStyles.value}`}>{value}</Text>
-      {subtitle ? (
-        <Text className={`text-sm mt-1 ${toneStyles.subtitle}`}>{subtitle}</Text>
-      ) : null}
+    <View
+      style={[
+        styles.notificationIconWrap,
+        {
+          backgroundColor: meta.bg,
+          borderColor: meta.border,
+        },
+      ]}
+    >
+      {meta.iconLib === "feather" ? (
+        <Feather name={meta.icon} size={18} color={meta.tint} />
+      ) : (
+        <Ionicons name={meta.icon} size={18} color={meta.tint} />
+      )}
     </View>
   );
 }
 
-export default function Notification() {
-  const { isConnected, bleReady, isScanning } = useBle();
+export default function NotificationScreen() {
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
-  // const {
-  //   status,
-  //   mode,
-  //   weight,
-  //   lastEvent,
-  //   binFullAlert,
-  //   requestStatus,
-  //   requestWeight,
-  //   syncDeviceTimeNow,
-  // } = useBleCommands();
+  const [statusData, setStatusData] = useState<DeviceStatus | null>(null);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [notifications, setNotifications] = useState<AppNotification[]>([]);
 
-  // const cards = useMemo(() => {
-  //   const numericWeight = Number(weight || 0);
-  //   const weightText = Number.isNaN(numericWeight)
-  //     ? "--"
-  //     : `${numericWeight.toFixed(1)} g`;
+  const lastWifiRef = useRef<boolean | null>(null);
+  const lastBinFullRef = useRef<boolean | null>(null);
+  const seenHistoryIdsRef = useRef<Set<string>>(new Set());
 
-  //   return [
-  //     {
-  //       title: "BLE",
-  //       value: bleReady
-  //         ? isConnected
-  //           ? "Connected"
-  //           : isScanning
-  //           ? "Scanning..."
-  //           : "Disconnected"
-  //         : "Bluetooth Off",
-  //       subtitle: bleReady
-  //         ? isConnected
-  //           ? "The app is connected to the ESP32."
-  //           : "Tap connect from the dashboard or BLE indicator."
-  //         : "Turn on Bluetooth to connect to the device.",
-  //       tone: isConnected
-  //         ? "success"
-  //         : isScanning
-  //         ? "warning"
-  //         : "default",
-  //     },
-  //     {
-  //       title: "Conveyor",
-  //       value: status || "Unknown",
-  //       subtitle:
-  //         String(status).toUpperCase() === "RUNNING"
-  //           ? "The conveyor is currently operating."
-  //           : "The conveyor is currently stopped.",
-  //       tone:
-  //         String(status).toUpperCase() === "RUNNING" ? "info" : "default",
-  //     },
-  //     {
-  //       title: "Mode",
-  //       value: mode || "Unknown",
-  //       subtitle:
-  //         String(mode).toUpperCase() === "AUTO"
-  //           ? "Schedules can run the conveyor automatically."
-  //           : "The system is currently under manual control.",
-  //       tone:
-  //         String(mode).toUpperCase() === "AUTO" ? "info" : "warning",
-  //     },
-  //     {
-  //       title: "Weight",
-  //       value: weightText,
-  //       subtitle: "Current waste-bin weight reported by the ESP32.",
-  //       tone:
-  //         !Number.isNaN(numericWeight) && numericWeight >= 500
-  //           ? "danger"
-  //           : "success",
-  //     },
-  //     {
-  //       title: "Bin Alert",
-  //       value: binFullAlert ? "Waste Bin Full" : "No Active Alert",
-  //       subtitle: binFullAlert
-  //         ? binFullAlert
-  //         : "No full-bin notification is active right now.",
-  //       tone: binFullAlert ? "danger" : "default",
-  //     },
-  //     {
-  //       title: "Last Event",
-  //       value: lastEvent || "No recent event",
-  //       subtitle: "Most recent BLE event received from the ESP32.",
-  //       tone: "default",
-  //     },
-  //   ] as const;
-  // }, [bleReady, isConnected, isScanning, status, mode, weight, binFullAlert, lastEvent]);
+  useEffect(() => {
+    const statusRef = ref(db, `/devices/${DEVICE_ID}/status`);
+    const historyRef = ref(db, `/devices/${DEVICE_ID}/history`);
 
-  // const handleRefresh = async () => {
-  //   if (!isConnected) {
-  //     Alert.alert("Not Connected", "Please connect to the ESP32 first.");
-  //     return;
-  //   }
+    const unsubStatus = onValue(
+      statusRef,
+      (snapshot) => {
+        const status = snapshot.val() as DeviceStatus | null;
+        setStatusData(status);
 
-  //   try {
-  //     await requestStatus();
-  //     await new Promise(resolve => setTimeout(resolve, 120));
-  //     await requestWeight();
-  //   } catch (e: any) {
-  //     Alert.alert(
-  //       "Refresh Failed",
-  //       e?.message ?? "Failed to refresh notifications."
-  //     );
-  //   }
-  // };
+        const wifiConnected = !!status?.wifiConnected;
+        const binFull = !!status?.loadCell?.binFull;
+        const weightGrams = Number(status?.loadCell?.weightGrams ?? 0);
+        const threshold = Number(status?.settings?.binFullThresholdGrams ?? 500);
 
-  // const handleSyncTime = async () => {
-  //   if (!isConnected) {
-  //     Alert.alert("Not Connected", "Please connect to the ESP32 first.");
-  //     return;
-  //   }
+        if (lastWifiRef.current === null) {
+          lastWifiRef.current = wifiConnected;
+        } else if (lastWifiRef.current !== wifiConnected) {
+          const newNotification: AppNotification = wifiConnected
+            ? {
+                id: `wifi_connected_${Date.now()}`,
+                type: "success",
+                title: "ESP32 Connected",
+                message: "The device is now online and connected to Firebase.",
+                timestamp: Date.now(),
+                source: "status",
+              }
+            : {
+                id: `wifi_disconnected_${Date.now()}`,
+                type: "error",
+                title: "ESP32 Disconnected",
+                message: "The device went offline. Check power or Wi-Fi connection.",
+                timestamp: Date.now(),
+                source: "status",
+              };
 
-  //   try {
-  //     await syncDeviceTimeNow();
-  //     Alert.alert("Success", "Device time synced.");
-  //   } catch (e: any) {
-  //     Alert.alert(
-  //       "Time Sync Failed",
-  //       e?.message ?? "Failed to sync device time."
-  //     );
-  //   }
-  // };
+          setNotifications((prev) => [newNotification, ...prev]);
+          lastWifiRef.current = wifiConnected;
+        }
+
+        if (lastBinFullRef.current === null) {
+          lastBinFullRef.current = binFull;
+        } else if (lastBinFullRef.current !== binFull) {
+          if (binFull) {
+            const newNotification: AppNotification = {
+              id: `bin_full_${Date.now()}`,
+              type: "warning",
+              title: "Bin Full Alert",
+              message: `The load cell detected a full bin. Current weight: ${weightGrams.toFixed(
+                0
+              )} g • Threshold: ${threshold.toFixed(0)} g.`,
+              timestamp: Date.now(),
+              source: "status",
+            };
+            setNotifications((prev) => [newNotification, ...prev]);
+          } else {
+            const newNotification: AppNotification = {
+              id: `bin_cleared_${Date.now()}`,
+              type: "info",
+              title: "Bin Status Cleared",
+              message: "The bin is no longer marked as full.",
+              timestamp: Date.now(),
+              source: "status",
+            };
+            setNotifications((prev) => [newNotification, ...prev]);
+          }
+
+          lastBinFullRef.current = binFull;
+        }
+
+        setLoading(false);
+      },
+      () => {
+        setLoading(false);
+      }
+    );
+
+    const unsubHistory = onValue(
+      historyRef,
+      (snapshot) => {
+        const items = mapHistory(snapshot.val());
+        setHistory(items);
+
+        items.forEach((item) => {
+          if (seenHistoryIdsRef.current.has(item.id)) return;
+
+          if (seenHistoryIdsRef.current.size === 0) {
+            seenHistoryIdsRef.current.add(item.id);
+            return;
+          }
+
+          const status = item.status || "UNKNOWN";
+
+          let newNotification: AppNotification | null = null;
+
+          if (status === "EXECUTED") {
+            newNotification = {
+              id: `history_success_${item.id}`,
+              type: "success",
+              title: "Schedule Completed",
+              message: buildHistoryMessage(item),
+              timestamp: Number(item.executedAt ?? Date.now()),
+              source: "history",
+            };
+          } else if (status === "FAILED") {
+            newNotification = {
+              id: `history_failed_${item.id}`,
+              type: "error",
+              title: "Schedule Failed",
+              message: buildHistoryMessage(item),
+              timestamp: Number(item.executedAt ?? Date.now()),
+              source: "history",
+            };
+          } else if (status === "SKIPPED") {
+            newNotification = {
+              id: `history_skipped_${item.id}`,
+              type: "warning",
+              title: "Schedule Skipped",
+              message: buildHistoryMessage(item),
+              timestamp: Number(item.executedAt ?? Date.now()),
+              source: "history",
+            };
+          }
+
+          if (newNotification) {
+            setNotifications((prev) => [newNotification!, ...prev]);
+          }
+
+          seenHistoryIdsRef.current.add(item.id);
+        });
+
+        if (seenHistoryIdsRef.current.size === 0) {
+          items.forEach((item) => seenHistoryIdsRef.current.add(item.id));
+        }
+      }
+    );
+
+    return () => {
+      unsubStatus();
+      unsubHistory();
+    };
+  }, []);
+
+  const refreshAll = async () => {
+    setRefreshing(true);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    setRefreshing(false);
+  };
+
+  const sortedNotifications = useMemo(() => {
+    return [...notifications].sort((a, b) => b.timestamp - a.timestamp);
+  }, [notifications]);
+
+  const summary = useMemo(() => {
+    const success = sortedNotifications.filter((n) => n.type === "success").length;
+    const warning = sortedNotifications.filter((n) => n.type === "warning").length;
+    const error = sortedNotifications.filter((n) => n.type === "error").length;
+    return { success, warning, error };
+  }, [sortedNotifications]);
 
   return (
-    <ScrollView
-      className="flex-1 bg-gray-50"
-      contentContainerStyle={{ padding: 16, paddingBottom: 32 }}
-      // refreshControl={
-      //   <RefreshControl refreshing={false} onRefresh={handleRefresh} />
-      // }
-    >
-      {/* <View className="mb-6">
-        <Text className="text-3xl font-bold text-gray-900">Notifications</Text>
-        <Text className="text-sm text-gray-500 mt-1">
-          Live BLE updates and current device state
-        </Text>
-      </View>
-
-      <View className="flex-row gap-3 mb-4">
-        <TouchableOpacity
-          onPress={handleRefresh}
-          className="flex-1 bg-blue-600 rounded-2xl py-4 px-4 flex-row items-center justify-center"
-        >
-          <Feather name="refresh-cw" size={16} color="white" />
-          <Text className="text-white font-bold ml-2">Refresh</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          onPress={handleSyncTime}
-          className="flex-1 bg-slate-800 rounded-2xl py-4 px-4 flex-row items-center justify-center"
-        >
-          <Feather name="clock" size={16} color="white" />
-          <Text className="text-white font-bold ml-2">Sync Time</Text>
-        </TouchableOpacity>
-      </View>
-
-      {cards.map((card) => (
-        <NotificationCard
-          key={card.title}
-          title={card.title}
-          value={card.value}
-          subtitle={card.subtitle}
-          tone={card.tone}
-        />
-      ))}
-
-      {!isConnected ? (
-        <View className="bg-white rounded-3xl p-6 border border-gray-100 shadow-sm mt-2">
-          <Text className="text-lg font-semibold text-gray-900 mb-1">
-            Device not connected
-          </Text>
-          <Text className="text-sm text-gray-500">
-            Connect to your ESP32 to receive live updates and alerts.
+    <SafeAreaView style={styles.container}>
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.content}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={refreshAll} />
+        }
+      >
+        <View style={styles.header}>
+          <Text style={styles.pageTitle}>Notifications</Text>
+          <Text style={styles.pageSubtitle}>
+            Alerts for bin full, schedule results, and ESP32 connection status
           </Text>
         </View>
-      ) : null} */}
-    </ScrollView>
+
+        <View style={styles.summaryRow}>
+          <View style={styles.summaryCard}>
+            <View style={[styles.summaryIconWrap, { backgroundColor: "#dcfce7" }]}>
+              <Feather name="check-circle" size={18} color="#16a34a" />
+            </View>
+            <Text style={styles.summaryLabel}>Success</Text>
+            <Text style={styles.summaryValue}>{summary.success}</Text>
+          </View>
+
+          <View style={styles.summaryCard}>
+            <View style={[styles.summaryIconWrap, { backgroundColor: "#fef3c7" }]}>
+              <Ionicons name="warning" size={18} color="#d97706" />
+            </View>
+            <Text style={styles.summaryLabel}>Warnings</Text>
+            <Text style={styles.summaryValue}>{summary.warning}</Text>
+          </View>
+
+          <View style={styles.summaryCard}>
+            <View style={[styles.summaryIconWrap, { backgroundColor: "#fee2e2" }]}>
+              <Ionicons name="close-circle" size={18} color="#dc2626" />
+            </View>
+            <Text style={styles.summaryLabel}>Errors</Text>
+            <Text style={styles.summaryValue}>{summary.error}</Text>
+          </View>
+        </View>
+
+        <View style={styles.liveStatusCard}>
+          <View style={styles.liveStatusHeader}>
+            <Text style={styles.sectionTitle}>Live Status</Text>
+            <MaterialCommunityIcons name="bell-outline" size={20} color="#64748b" />
+          </View>
+
+          <View style={styles.liveStatusRow}>
+            <Text style={styles.liveLabel}>ESP32</Text>
+            <Text
+              style={[
+                styles.liveValue,
+                { color: statusData?.wifiConnected ? "#16a34a" : "#dc2626" },
+              ]}
+            >
+              {statusData?.wifiConnected ? "Connected" : "Disconnected"}
+            </Text>
+          </View>
+
+          <View style={styles.liveStatusRow}>
+            <Text style={styles.liveLabel}>Bin Status</Text>
+            <Text
+              style={[
+                styles.liveValue,
+                { color: statusData?.loadCell?.binFull ? "#d97706" : "#16a34a" },
+              ]}
+            >
+              {statusData?.loadCell?.binFull ? "Full" : "Normal"}
+            </Text>
+          </View>
+
+          <View style={[styles.liveStatusRow, { borderBottomWidth: 0 }]}>
+            <Text style={styles.liveLabel}>Current Weight</Text>
+            <Text style={styles.liveValue}>
+              {Number(statusData?.loadCell?.weightGrams ?? 0).toFixed(0)} g
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.listHeader}>
+          <Text style={styles.sectionTitle}>Recent Notifications</Text>
+          <TouchableOpacity
+            onPress={() => setNotifications([])}
+            style={styles.clearButton}
+          >
+            <Text style={styles.clearButtonText}>Clear</Text>
+          </TouchableOpacity>
+        </View>
+
+        {loading ? (
+          <View style={styles.loadingCard}>
+            <ActivityIndicator size="large" color="#2563eb" />
+            <Text style={styles.loadingText}>Loading notifications...</Text>
+          </View>
+        ) : sortedNotifications.length === 0 ? (
+          <View style={styles.emptyCard}>
+            <View style={styles.emptyIconWrap}>
+              <Ionicons name="notifications-off-outline" size={28} color="#64748b" />
+            </View>
+            <Text style={styles.emptyTitle}>No notifications yet</Text>
+            <Text style={styles.emptySub}>
+              New alerts will appear here when the device connects, disconnects,
+              the bin becomes full, or schedules finish.
+            </Text>
+          </View>
+        ) : (
+          sortedNotifications.map((item) => (
+            <View key={item.id} style={styles.notificationCard}>
+              <NotificationIcon type={item.type} />
+
+              <View style={styles.notificationBody}>
+                <View style={styles.notificationTopRow}>
+                  <Text style={styles.notificationTitle}>{item.title}</Text>
+                  <Text style={styles.notificationTime}>{formatTimeAgo(item.timestamp)}</Text>
+                </View>
+
+                <Text style={styles.notificationMessage}>{item.message}</Text>
+
+                <View style={styles.notificationFooter}>
+                  <Text style={styles.notificationSource}>
+                    {item.source === "history"
+                      ? "Schedule"
+                      : item.source === "status"
+                      ? "Device"
+                      : "System"}
+                  </Text>
+                </View>
+              </View>
+            </View>
+          ))
+        )}
+
+        <View style={{ height: 24 }} />
+      </ScrollView>
+    </SafeAreaView>
   );
 }
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#f8fafc",
+  },
+  content: {
+    paddingHorizontal: 18,
+    paddingTop: 18,
+    paddingBottom: 40,
+  },
+  header: {
+    marginBottom: 16,
+  },
+  pageTitle: {
+    fontSize: 28,
+    fontWeight: "900",
+    color: "#0f172a",
+  },
+  pageSubtitle: {
+    marginTop: 6,
+    fontSize: 14,
+    lineHeight: 20,
+    color: "#64748b",
+  },
+  summaryRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 16,
+  },
+  summaryCard: {
+    width: "31.5%",
+    backgroundColor: "#ffffff",
+    borderRadius: 22,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  summaryIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 10,
+  },
+  summaryLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#64748b",
+  },
+  summaryValue: {
+    marginTop: 6,
+    fontSize: 20,
+    fontWeight: "900",
+    color: "#0f172a",
+  },
+  liveStatusCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 24,
+    padding: 18,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  liveStatusHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 10,
+    alignItems: "center",
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: "800",
+    color: "#0f172a",
+  },
+  liveStatusRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#f1f5f9",
+  },
+  liveLabel: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#64748b",
+  },
+  liveValue: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#0f172a",
+  },
+  listHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 14,
+  },
+  clearButton: {
+    backgroundColor: "#eef2ff",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  clearButtonText: {
+    color: "#2563eb",
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  loadingCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 24,
+    paddingVertical: 30,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  loadingText: {
+    marginTop: 12,
+    color: "#64748b",
+    fontWeight: "600",
+  },
+  emptyCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 24,
+    paddingVertical: 36,
+    paddingHorizontal: 20,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  emptyIconWrap: {
+    width: 64,
+    height: 64,
+    borderRadius: 999,
+    backgroundColor: "#f1f5f9",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  emptyTitle: {
+    marginTop: 16,
+    fontSize: 18,
+    fontWeight: "800",
+    color: "#0f172a",
+  },
+  emptySub: {
+    marginTop: 8,
+    fontSize: 13,
+    lineHeight: 20,
+    color: "#64748b",
+    textAlign: "center",
+  },
+  notificationCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 22,
+    padding: 14,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    flexDirection: "row",
+    alignItems: "flex-start",
+  },
+  notificationIconWrap: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  notificationBody: {
+    flex: 1,
+  },
+  notificationTopRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  notificationTitle: {
+    flex: 1,
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#0f172a",
+  },
+  notificationTime: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#94a3b8",
+  },
+  notificationMessage: {
+    marginTop: 6,
+    fontSize: 13,
+    lineHeight: 19,
+    color: "#475569",
+  },
+  notificationFooter: {
+    marginTop: 10,
+    flexDirection: "row",
+  },
+  notificationSource: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#334155",
+    backgroundColor: "#f1f5f9",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
+});

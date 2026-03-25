@@ -867,14 +867,11 @@ export default function ScheduleScreen() {
                   <Text className="text-[12px] font-extrabold uppercase tracking-[1.2px] text-slate-400">
                     History for {selectedDate}
                   </Text>
-
-                  {historyForSelectedDate.length > 0 ? (
                     <TouchableOpacity onPress={openHistoryModal}>
                       <Text className="text-sm font-bold text-blue-600">
                         View All History
                       </Text>
                     </TouchableOpacity>
-                  ) : null}
                 </View>
 
                 {loadingHistory ? (

@@ -380,7 +380,7 @@ export default function Dashboard() {
 
   const fillPct = loadPresent ? 100 : 0;
 
-  const chartWidth = width - 72;
+  const chartWidth = width - 90;
 
   const binTrendData = {
     labels: ["0", "25", "50", "75", "Now"],
@@ -697,7 +697,7 @@ export default function Dashboard() {
                     labelColor: (opacity = 1) => `rgba(100,116,139, ${opacity})`,
                   }}
                   hideLegend={false}
-                  style={{ marginLeft: -8 }}
+                  style={{ marginLeft: -14 }}
                 />
 
                 <View
@@ -715,6 +715,8 @@ export default function Dashboard() {
                   </Text>
                 </View>
               </View>
+
+              
             </Card>
 
             {/* <Card style={shadowStyle}>

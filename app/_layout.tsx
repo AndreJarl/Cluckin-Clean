@@ -12,7 +12,6 @@ import { en, registerTranslation } from "react-native-paper-dates";
 import "react-native-reanimated";
 
 import { useColorScheme } from "@/hooks/useColorScheme";
-import { BleProvider } from "@/providers/ble/BleProvider";
 import { useEffect } from "react";
 import { MD3LightTheme, PaperProvider } from "react-native-paper";
 
@@ -49,7 +48,6 @@ export default function RootLayout() {
   return (
     <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
       <PaperProvider theme={theme}>
-        <BleProvider>
      
             <Stack>
               <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
@@ -57,7 +55,6 @@ export default function RootLayout() {
             </Stack>
         
           <StatusBar style="dark" />
-        </BleProvider>
       </PaperProvider>
     </ThemeProvider>
   );
