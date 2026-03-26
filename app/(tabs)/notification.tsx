@@ -42,7 +42,7 @@ type HistoryItem = {
   hour?: string;
   minute?: string;
   duration?: string;
-  executedAt?: number;
+  executedAt?: number | string;
   scheduleId?: string;
 };
 
@@ -51,43 +51,104 @@ type AppNotification = {
   type: "success" | "error" | "warning" | "info";
   title: string;
   message: string;
-  timestamp: number;
+  timestamp?: number;
   source: "status" | "history" | "system";
 };
+
+function normalizeTimestamp(value?: number | string): number | undefined {
+  if (value == null) return undefined;
+
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return undefined;
+
+  // seconds -> milliseconds
+  if (num < 1e12) return num * 1000;
+
+  return num;
+}
+
+function buildTimestampFromHistory(item: HistoryItem): number | undefined {
+  const executedAt = normalizeTimestamp(item.executedAt);
+  if (executedAt) return executedAt;
+
+  if (!item.date) return undefined;
+
+  const hour = Number(item.hour);
+  const minute = Number(item.minute);
+
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return undefined;
+
+  const [year, month, day] = item.date.split("-").map(Number);
+  if (!year || !month || !day) return undefined;
+
+  const dt = new Date(year, month - 1, day, hour, minute, 0, 0);
+  const time = dt.getTime();
+
+  if (!Number.isFinite(time) || time <= 0) return undefined;
+
+  return time;
+}
 
 function mapHistory(
   value: Record<string, Omit<HistoryItem, "id">> | null | undefined
 ): HistoryItem[] {
   if (!value) return [];
+
   return Object.entries(value)
-    .map(([id, item]) => ({
-      id,
-      ...(item as Omit<HistoryItem, "id">),
-    }))
+    .map(([id, item]) => {
+      const raw = item as Omit<HistoryItem, "id">;
+      return {
+        id,
+        ...raw,
+        executedAt: buildTimestampFromHistory({ id, ...raw }),
+      };
+    })
     .sort((a, b) => Number(b.executedAt ?? 0) - Number(a.executedAt ?? 0));
 }
 
 function formatTimeAgo(ts?: number) {
-  if (!ts) return "--";
+  if (!ts || !Number.isFinite(ts) || ts <= 0) return "Unknown time";
+
   const diff = Date.now() - ts;
+
+  if (diff < 0) return "In the future";
+
   const sec = Math.floor(diff / 1000);
-  if (sec < 5) return "Just now";
   if (sec < 60) return `${sec}s ago`;
+
   const min = Math.floor(sec / 60);
   if (min < 60) return `${min}m ago`;
+
   const hr = Math.floor(min / 60);
   if (hr < 24) return `${hr}h ago`;
+
   const day = Math.floor(hr / 24);
-  return `${day}d ago`;
+  if (day < 7) return `${day}d ago`;
+
+  const week = Math.floor(day / 7);
+  if (week < 5) return `${week}w ago`;
+
+  const month = Math.floor(day / 30);
+  if (month < 12) return `${month}mo ago`;
+
+  const year = Math.floor(day / 365);
+  return `${year}y ago`;
 }
 
 function formatTo12Hour(hour?: string, minute?: string) {
-  if (!hour || !minute) return "--";
+  if (hour == null || minute == null) return "--";
+
   let h = Number(hour);
-  const m = String(minute).padStart(2, "0");
+  if (!Number.isFinite(h)) return "--";
+
+  const mNum = Number(minute);
+  if (!Number.isFinite(mNum)) return "--";
+
+  const m = String(mNum).padStart(2, "0");
   const period = h >= 12 ? "PM" : "AM";
   h = h % 12;
   if (h === 0) h = 12;
+
   return `${h}:${m} ${period}`;
 }
 
@@ -246,65 +307,59 @@ export default function NotificationScreen() {
       }
     );
 
-    const unsubHistory = onValue(
-      historyRef,
-      (snapshot) => {
-        const items = mapHistory(snapshot.val());
-        setHistory(items);
+    const unsubHistory = onValue(historyRef, (snapshot) => {
+      const items = mapHistory(snapshot.val());
+      setHistory(items);
 
-        items.forEach((item) => {
-          if (seenHistoryIdsRef.current.has(item.id)) return;
-
-          if (seenHistoryIdsRef.current.size === 0) {
-            seenHistoryIdsRef.current.add(item.id);
-            return;
-          }
-
-          const status = item.status || "UNKNOWN";
-
-          let newNotification: AppNotification | null = null;
-
-          if (status === "EXECUTED") {
-            newNotification = {
-              id: `history_success_${item.id}`,
-              type: "success",
-              title: "Schedule Completed",
-              message: buildHistoryMessage(item),
-              timestamp: Number(item.executedAt ?? Date.now()),
-              source: "history",
-            };
-          } else if (status === "FAILED") {
-            newNotification = {
-              id: `history_failed_${item.id}`,
-              type: "error",
-              title: "Schedule Failed",
-              message: buildHistoryMessage(item),
-              timestamp: Number(item.executedAt ?? Date.now()),
-              source: "history",
-            };
-          } else if (status === "SKIPPED") {
-            newNotification = {
-              id: `history_skipped_${item.id}`,
-              type: "warning",
-              title: "Schedule Skipped",
-              message: buildHistoryMessage(item),
-              timestamp: Number(item.executedAt ?? Date.now()),
-              source: "history",
-            };
-          }
-
-          if (newNotification) {
-            setNotifications((prev) => [newNotification!, ...prev]);
-          }
-
-          seenHistoryIdsRef.current.add(item.id);
-        });
+      items.forEach((item) => {
+        if (seenHistoryIdsRef.current.has(item.id)) return;
 
         if (seenHistoryIdsRef.current.size === 0) {
-          items.forEach((item) => seenHistoryIdsRef.current.add(item.id));
+          seenHistoryIdsRef.current.add(item.id);
+          return;
         }
-      }
-    );
+
+        const status = item.status || "UNKNOWN";
+        const eventTimestamp = buildTimestampFromHistory(item);
+
+        let newNotification: AppNotification | null = null;
+
+        if (status === "EXECUTED") {
+          newNotification = {
+            id: `history_success_${item.id}`,
+            type: "success",
+            title: "Schedule Completed",
+            message: buildHistoryMessage(item),
+            timestamp: eventTimestamp,
+            source: "history",
+          };
+        } else if (status === "FAILED") {
+          newNotification = {
+            id: `history_failed_${item.id}`,
+            type: "error",
+            title: "Schedule Failed",
+            message: buildHistoryMessage(item),
+            timestamp: eventTimestamp,
+            source: "history",
+          };
+        } else if (status === "SKIPPED") {
+          newNotification = {
+            id: `history_skipped_${item.id}`,
+            type: "warning",
+            title: "Schedule Skipped",
+            message: buildHistoryMessage(item),
+            timestamp: eventTimestamp,
+            source: "history",
+          };
+        }
+
+        if (newNotification) {
+          setNotifications((prev) => [newNotification, ...prev]);
+        }
+
+        seenHistoryIdsRef.current.add(item.id);
+      });
+    });
 
     return () => {
       unsubStatus();
@@ -319,7 +374,9 @@ export default function NotificationScreen() {
   };
 
   const sortedNotifications = useMemo(() => {
-    return [...notifications].sort((a, b) => b.timestamp - a.timestamp);
+    return [...notifications].sort(
+      (a, b) => Number(b.timestamp ?? 0) - Number(a.timestamp ?? 0)
+    );
   }, [notifications]);
 
   const summary = useMemo(() => {
@@ -443,7 +500,6 @@ export default function NotificationScreen() {
               <View style={styles.notificationBody}>
                 <View style={styles.notificationTopRow}>
                   <Text style={styles.notificationTitle}>{item.title}</Text>
-                  <Text style={styles.notificationTime}>{formatTimeAgo(item.timestamp)}</Text>
                 </View>
 
                 <Text style={styles.notificationMessage}>{item.message}</Text>
