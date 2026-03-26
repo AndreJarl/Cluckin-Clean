@@ -11,7 +11,7 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
-import { LineChart, ProgressChart } from "react-native-chart-kit";
+import { BarChart, LineChart } from "react-native-chart-kit";
 import { onValue, ref, update } from "firebase/database";
 
 import { db } from "@/lib/firebase";
@@ -399,11 +399,17 @@ export default function Dashboard() {
   };
 
   const scheduleDistribution = {
-    labels: ["Enabled", "Disabled", "Executed"],
-    data: [
-      schedules.length > 0 ? enabledSchedules.length / Math.max(1, schedules.length) : 0,
-      schedules.length > 0 ? disabledSchedules.length / Math.max(1, schedules.length) : 0,
-      history.length > 0 ? Math.min(1, executedCount / Math.max(1, history.length)) : 0,
+    labels: ["Enabled", "Disabled", "Executed", "Failed", "Skipped"],
+    datasets: [
+      {
+        data: [
+          enabledSchedules.length,
+          disabledSchedules.length,
+          executedCount,
+          failedCount,
+          skippedCount,
+        ],
+      },
     ],
   };
 
@@ -684,20 +690,33 @@ export default function Dashboard() {
                   Schedule mix
                 </Text>
 
-                <ProgressChart
+                <BarChart
                   data={scheduleDistribution}
                   width={chartWidth}
-                  height={190}
-                  strokeWidth={16}
-                  radius={32}
+                  height={220}
+                  yAxisLabel=""
+                  yAxisSuffix=""
+                  fromZero
+                  showValuesOnTopOfBars
+                  withInnerLines
+                  withHorizontalLabels
                   chartConfig={{
                     backgroundGradientFrom: "#ffffff",
                     backgroundGradientTo: "#ffffff",
+                    decimalPlaces: 0,
                     color: (opacity = 1) => `rgba(99, 102, 241, ${opacity})`,
-                    labelColor: (opacity = 1) => `rgba(100,116,139, ${opacity})`,
+                    labelColor: (opacity = 1) => `rgba(100, 116, 139, ${opacity})`,
+                    propsForBackgroundLines: {
+                      stroke: "#e2e8f0",
+                    },
+                    fillShadowGradient: "#6366f1",
+                    fillShadowGradientOpacity: 1,
+                    barPercentage: 0.65,
                   }}
-                  hideLegend={false}
-                  style={{ marginLeft: -14 }}
+                  style={{
+                    borderRadius: 16,
+                    marginLeft: -10,
+                  }}
                 />
 
                 <View
@@ -715,8 +734,6 @@ export default function Dashboard() {
                   </Text>
                 </View>
               </View>
-
-              
             </Card>
 
             {/* <Card style={shadowStyle}>
